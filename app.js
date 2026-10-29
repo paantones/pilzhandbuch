@@ -201,11 +201,19 @@ const sb = SUPABASE_URL && window.supabase ? window.supabase.createClient(SUPABA
 let session = null, profile = null;
 async function initAuth() {
   if (!sb) return;
-  const {data} = await sb.auth.getSession(); session = data.session;
+  window.__step = 'Anmeldung prüfen';
+  try {
+    const r = await Promise.race([sb.auth.getSession(), sleep(6000).then(() => ({data: {session: null}, timeout: true}))]);
+    session = r.data?.session || null;
+    if (r.timeout) console.warn('getSession Zeitüberschreitung');
+  } catch (e) { console.warn('getSession', e); }
   sb.auth.onAuthStateChange((_e, s) => {
     session = s;
-    if (s) { loadProfile(); loadComms(); sync(); const j = store.get('joinCode', null); if (j) location.hash = '#/beitreten/' + j; }
-    else { profile = null; myComms = []; store.set('comms', []); }
+    // Supabase-Aufrufe nicht direkt im Callback starten (kann sonst blockieren)
+    setTimeout(() => {
+      if (s) { loadProfile(); loadComms(); sync(); const j = store.get('joinCode', null); if (j) location.hash = '#/beitreten/' + j; }
+      else { profile = null; myComms = []; store.set('comms', []); }
+    }, 0);
   });
   if (session) { loadProfile(); loadComms(); }
 }
@@ -1049,6 +1057,7 @@ async function viewBeitreten(code) {
 
 /* Einrichtung: eigenes PDF laden */
 function viewSetup(err) {
+  window.__started = true;
   document.getElementById('tabs').hidden = true;
   setView('Pilzhandbuch', `
     <div class="card">
@@ -1106,20 +1115,28 @@ async function route() {
 window.addEventListener('hashchange', () => { if ($zoom.classList.contains('on')) { $zoom.classList.remove('on'); $zin.innerHTML = ''; } route(); });
 
 async function start() {
+  window.__step = 'Buch öffnen';
   const jm = location.hash.match(/^#\/beitreten\/([0-9a-zA-Z]+)/); if (jm && !session) store.set('joinCode', jm[1]);
   const blob = await loadPdfBlob();
   if (!blob) return viewSetup();
   try { doc = await openPdf(blob); }
   catch (e) { console.error(e); return viewSetup('Das gespeicherte PDF konnte nicht geöffnet werden. Bitte wähle es noch einmal aus.'); }
   document.getElementById('tabs').hidden = false;
+  window.__started = true;
   route();
   sync();
 }
 
 (async () => {
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
-  await loadIndex();
-  await initAuth();
-  profile ||= store.get('profile', null);
-  await start();
+  try {
+    if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+    window.__step = 'Register laden'; await loadIndex();
+    await initAuth();
+    profile ||= store.get('profile', null);
+    window.__step = 'Buch auf dem Gerät suchen'; await start();
+    window.__started = true;
+  } catch (e) {
+    console.error(e);
+    window.__fail?.(e);
+  }
 })();
