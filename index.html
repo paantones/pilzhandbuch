@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pilzhandbuch</title>
+<meta name="description" content="Begleit-App zum eBook „Das Kosmos Handbuch Pilze“ mit Bestimmungsschlüssel und gemeinsamer Fund-Datenbank">
+<meta name="theme-color" content="#2f4a32">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="vendor/leaflet.css">
+<style>
+:root{
+  --bg:#f5f1e8; --card:#fffdf8; --ink:#25221c; --muted:#6c6457; --line:#ddd4c3;
+  --accent:#2f4a32; --accent-ink:#fff; --accent-soft:#e3eadc; --warn:#9a3412; --warn-soft:#fbe7dc;
+  --chip:#efe8da; --shadow:0 1px 2px rgba(60,45,20,.08),0 2px 8px rgba(60,45,20,.06);
+  --fs:16px;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#1b1a17; --card:#25231f; --ink:#ece6da; --muted:#a59c8c; --line:#3a362f;
+    --accent:#9dc29a; --accent-ink:#13200f; --accent-soft:#2c3a2a; --warn:#f0a07a; --warn-soft:#3b2a20; --chip:#302d27;
+    --shadow:0 1px 2px rgba(0,0,0,.3); }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink)}
+body{font:var(--fs)/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+a{color:inherit}
+header.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:8px;padding:10px 12px;padding-top:max(10px,env(safe-area-inset-top));
+  background:var(--accent);color:var(--accent-ink)}
+@media (prefers-color-scheme: dark){ header.top{background:#22311f;color:var(--ink)} }
+header.top h1{font-size:18px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:650}
+header.top button{background:none;border:0;color:inherit;font:inherit;font-size:22px;padding:4px 8px;border-radius:8px;min-width:40px;min-height:40px}
+main{max-width:760px;margin:0 auto;padding:12px 14px 96px}
+nav.tabs{position:fixed;bottom:0;left:0;right:0;z-index:20;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav.tabs a{flex:1;text-align:center;text-decoration:none;padding:7px 2px 6px;font-size:12px;color:var(--muted)}
+nav.tabs a span{display:block;font-size:21px;line-height:1.1}
+nav.tabs a.on{color:var(--accent);font-weight:650}
+@media (prefers-color-scheme: dark){ nav.tabs a.on{color:var(--accent)} }
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:10px 0;box-shadow:var(--shadow)}
+.btn{display:block;width:100%;text-align:left;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:8px 0;font:inherit;color:inherit;text-decoration:none;box-shadow:var(--shadow);cursor:pointer}
+.btn b{display:block}.btn small{color:var(--muted)}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent;text-align:center;font-weight:650}
+.btn.center{text-align:center}
+.btn.danger{color:var(--warn)}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>.btn{flex:1;min-width:140px}
+.muted{color:var(--muted)}.tiny{font-size:13px;color:var(--muted)}
+.sect{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:22px 2px 6px;font-weight:650}
+.note{background:var(--accent-soft);border-radius:12px;padding:10px 12px;margin:10px 0;font-size:14px}
+.note.warn{background:var(--warn-soft)}
+input.inp,textarea.inp,select.inp{width:100%;font:inherit;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);margin:4px 0}
+textarea.inp{resize:vertical}
+input[type=search].inp{position:sticky;top:62px;z-index:5}
+.chip{display:inline-block;background:var(--chip);border:0;border-radius:999px;padding:5px 11px;margin:3px 4px 3px 0;font:inherit;font-size:14px;color:inherit;text-decoration:none;cursor:pointer}
+.chip.on{background:var(--accent);color:var(--accent-ink)}
+ul.list{list-style:none;margin:0;padding:0}
+.item{display:flex;gap:12px;align-items:center;padding:8px 4px;border-bottom:1px solid var(--line);text-decoration:none;color:inherit}
+.item .th{width:64px;height:64px;flex:0 0 64px;border-radius:10px;background:var(--chip);object-fit:contain}
+.item .th.cover{object-fit:cover}
+.item .txt{min-width:0;flex:1}
+.de{font-weight:600}.lat{font-style:italic;color:var(--muted);font-size:14px}
+.badge{display:inline-block;font-size:12px;font-weight:700;border-radius:6px;padding:1px 6px;margin-left:4px;vertical-align:2px;background:var(--warn-soft);color:var(--warn)}
+.spinner{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:30px auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+.prog{height:8px;background:var(--line);border-radius:4px;overflow:hidden}.prog>div{height:100%;background:var(--accent);width:0}
+/* Art */
+.art h2{margin:4px 0 0;font-size:24px;line-height:1.2}
+.art .latn{font-style:italic;color:var(--muted)}
+.plate{display:block;width:100%;max-height:60vh;object-fit:contain;background:#fff;border-radius:12px;margin:10px 0;cursor:zoom-in}
+.icons{height:30px;vertical-align:middle;background:#fff;border-radius:6px}
+.btext p{margin:.55em 0}
+.btext b.fl{display:inline-block;min-width:1.6em;color:var(--accent)}
+.btext a.ref{color:var(--accent);text-decoration:underline dotted}
+.arr{color:var(--accent);font-weight:700}
+/* Schlüssel */
+.trail{display:flex;flex-wrap:wrap;gap:2px;margin:4px 0 8px}
+.trail a{font-size:13px}
+.lead{position:relative;cursor:pointer}
+.lead .ll{position:absolute;top:10px;right:12px;font-weight:700;color:var(--muted)}
+.lead .lt{padding-right:22px}
+.lead .gl{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.lead .gl figure{margin:0;text-align:center;font-size:11px;color:var(--muted);width:76px}
+.lead .gl canvas,.lead .gl img{width:76px;height:auto;max-height:70px;object-fit:contain;background:#fff;border-radius:8px;border:1px solid var(--line)}
+.lead .ex{display:flex;gap:6px;overflow-x:auto;margin-top:10px;padding-bottom:2px}
+.lead .ex a{flex:0 0 70px;font-size:11px;line-height:1.2;text-decoration:none;color:var(--muted);text-align:center}
+.lead .ex img{width:70px;height:70px;object-fit:contain;background:#fff;border-radius:8px;display:block;margin-bottom:2px}
+.lead .go{margin-top:10px;display:flex;gap:6px;flex-wrap:wrap}
+.lead.leaf{cursor:default}
+/* Zoom */
+#zoom{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.92);display:none;overflow:auto;touch-action:pan-x pan-y pinch-zoom}
+#zoom.on{display:block}
+#zoom img,#zoom canvas{display:block;max-width:none;margin:auto}
+#zoom .x{position:fixed;top:max(10px,env(safe-area-inset-top));right:12px;font-size:28px;color:#fff;background:rgba(0,0,0,.5);border:0;border-radius:50%;width:46px;height:46px;z-index:2}
+.pagewrap{overflow:auto;background:#fff;border-radius:8px}
+.pagewrap canvas{display:block}
+/* Funde */
+.photos{display:flex;gap:6px;overflow-x:auto;margin:8px 0}
+.photos img{height:160px;border-radius:10px;cursor:zoom-in}
+.ph-edit{display:flex;gap:8px;flex-wrap:wrap}
+.ph-edit div{position:relative}.ph-edit img{width:90px;height:90px;object-fit:cover;border-radius:10px}
+.ph-edit button{position:absolute;top:-6px;right:-6px;border-radius:50%;border:0;width:26px;height:26px;background:var(--warn);color:#fff}
+#map{height:62vh;border-radius:14px;border:1px solid var(--line);margin:8px 0}
+.comment{border-top:1px solid var(--line);padding:8px 0}
+.gloss-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
+.gloss-grid figure{margin:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px;text-align:center;font-size:12px}
+.gloss-grid canvas{width:100%;height:auto;max-height:110px;object-fit:contain;background:#fff;border-radius:6px}
+.hl{background:#fde68a;color:#000;border-radius:3px}
+.sync{font-size:13px;padding:6px 10px;border-radius:10px;background:var(--chip);margin:6px 0}
+</style>
+</head>
+<body>
+<header class="top"><button id="back" aria-label="Zurück">‹</button><h1 id="title">Pilzhandbuch</h1><button id="fsz" aria-label="Schriftgröße">Aa</button></header>
+<main id="main"><div class="spinner"></div></main>
+<nav class="tabs" id="tabs" hidden>
+  <a href="#/" data-t="home"><span>🍄</span>Start</a>
+  <a href="#/k/0/1" data-t="k"><span>🔑</span>Bestimmen</a>
+  <a href="#/arten" data-t="arten"><span>📖</span>Arten</a>
+  <a href="#/funde" data-t="funde"><span>📍</span>Funde</a>
+  <a href="#/konto" data-t="konto"><span>👤</span>Konto</a>
+</nav>
+<div id="zoom"><button class="x" aria-label="Schließen">×</button><div id="zoomin"></div></div>
+<script src="vendor/supabase.js"></script>
+<script src="vendor/leaflet.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

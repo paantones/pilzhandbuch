@@ -1,0 +1,862 @@
+import * as pdfjsLib from './vendor/pdf.min.mjs';
+import {pageItems, speciesText, leadText} from './book.js';
+import {SUPABASE_URL, SUPABASE_KEY} from './config.js';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
+
+const $main = document.getElementById('main');
+const $title = document.getElementById('title');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const norm = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/ß/g, 'ss').replace(/[^a-z0-9]+/g, ' ').trim();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmtDate = d => d ? d.split('-').reverse().join('.') : '';
+const uuid = () => crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); });
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('ph.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('ph.' + k, JSON.stringify(v)); } catch {} }
+};
+
+/* ---------- IndexedDB ---------- */
+let dbP = null;
+function idb() {
+  return dbP ||= new Promise((res, rej) => {
+    const r = indexedDB.open('pilzhandbuch', 1);
+    r.onupgradeneeded = () => { for (const s of ['files', 'txt', 'img', 'outbox', 'cache']) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s); };
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function dbGet(s, k) { const db = await idb(); return new Promise(res => { const q = db.transaction(s).objectStore(s).get(k); q.onsuccess = () => res(q.result ?? null); q.onerror = () => res(null); }); }
+async function dbAll(s) { const db = await idb(); return new Promise(res => { const q = db.transaction(s).objectStore(s).getAll(); q.onsuccess = () => res(q.result || []); q.onerror = () => res([]); }); }
+async function dbKeys(s) { const db = await idb(); return new Promise(res => { const q = db.transaction(s).objectStore(s).getAllKeys(); q.onsuccess = () => res(q.result || []); q.onerror = () => res([]); }); }
+async function dbPut(s, k, v) { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction(s, 'readwrite'); t.objectStore(s).put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); }
+async function dbDel(s, k) { const db = await idb(); return new Promise(res => { const t = db.transaction(s, 'readwrite'); t.objectStore(s).delete(k); t.oncomplete = res; t.onerror = res; }); }
+async function dbClear(s) { const db = await idb(); return new Promise(res => { const t = db.transaction(s, 'readwrite'); t.objectStore(s).clear(); t.oncomplete = res; t.onerror = res; }); }
+
+/* ---------- Buch-PDF (bleibt auf dem Gerät) ---------- */
+const PDF_NAME = 'kosmos-handbuch-pilze.pdf';
+async function opfsDir() { try { return await navigator.storage.getDirectory(); } catch { return null; } }
+async function savePdf(file, onProgress) {
+  const dir = await opfsDir();
+  if (dir) {
+    try {
+      const fh = await dir.getFileHandle(PDF_NAME, {create: true});
+      const w = await fh.createWritable();
+      const CH = 8 << 20;
+      for (let o = 0; o < file.size; o += CH) { await w.write(await file.slice(o, o + CH).arrayBuffer()); onProgress?.(Math.min(1, (o + CH) / file.size)); }
+      await w.close();
+      await dbDel('files', 'pdf');
+      return;
+    } catch (e) { console.warn('OPFS nicht nutzbar, nehme IndexedDB', e); }
+  }
+  await dbPut('files', 'pdf', file);
+  onProgress?.(1);
+}
+async function loadPdfBlob() {
+  const b = await dbGet('files', 'pdf');
+  if (b) return b;
+  const dir = await opfsDir();
+  if (dir) { try { const fh = await dir.getFileHandle(PDF_NAME); const f = await fh.getFile(); if (f.size > 0) return f; } catch {} }
+  return null;
+}
+async function removePdf() {
+  await dbDel('files', 'pdf');
+  const dir = await opfsDir(); if (dir) { try { await dir.removeEntry(PDF_NAME); } catch {} }
+  await dbClear('txt'); await dbClear('img');
+}
+class BlobRange extends pdfjsLib.PDFDataRangeTransport {
+  constructor(blob) { super(blob.size, null); this.blob = blob; }
+  requestDataRange(begin, end) {
+    this.blob.slice(begin, end).arrayBuffer().then(b => this.onDataRange(begin, new Uint8Array(b)));
+  }
+}
+let doc = null;
+async function openPdf(blob) {
+  const task = pdfjsLib.getDocument({range: new BlobRange(blob), length: blob.size, disableAutoFetch: true, disableStream: true,
+    rangeChunkSize: 1 << 18, isEvalSupported: false, enableXfa: false});
+  const d = await task.promise;
+  return d;
+}
+async function checkBook(d) {
+  if (d.numPages !== IDX.fp.pages) return `Die Datei hat ${d.numPages} Seiten, erwartet sind ${IDX.fp.pages}. Ist das wirklich das eBook „Das Kosmos Handbuch Pilze“ (2023)?`;
+  // Stichprobe: stehen die erwarteten Artnamen an den erwarteten Stellen?
+  const probes = [IDX.species.find(s => s.p === 318), IDX.species[0], IDX.species[700]];
+  for (const s of probes) {
+    const it = await pageItems(d, s.p);
+    const head = it.filter(x => x.y > s.hdr[1] && x.y < s.hdr[3] + 4).map(x => x.s).join('');
+    if (!norm(head).replace(/ /g, '').includes(norm(s.de.split(',')[0]).replace(/ /g, ''))) return 'Die Datei passt nicht zu dieser App (andere Ausgabe des Buchs?). Gebraucht wird das eBook-PDF von 2023/24 mit 760 Seiten.';
+  }
+  return null;
+}
+
+/* ---------- Seiten-Text (Cache) ---------- */
+const itemCache = new Map();
+let pdfQueue = Promise.resolve();
+function viaQueue(fn) { const p = pdfQueue.then(fn, fn); pdfQueue = p.catch(() => {}); return p; }
+async function itemsOf(p) {
+  if (itemCache.has(p)) return itemCache.get(p);
+  const pr = pageItems(doc, p);
+  itemCache.set(p, pr);
+  if (itemCache.size > 40) itemCache.delete(itemCache.keys().next().value);
+  return pr;
+}
+async function spText(id) {
+  const key = 'sp:' + id;
+  let t = await dbGet('txt', key);
+  if (!t) { const s = IDX.species[id]; t = speciesText(await itemsOf(s.p), s); await dbPut('txt', key, t); }
+  return t;
+}
+async function ldText(kid, step, l) {
+  const key = `ld:${kid}:${step}${l.l}`;
+  let t = await dbGet('txt', key);
+  if (!t) { t = leadText(await itemsOf(l.p), l.box); await dbPut('txt', key, t); }
+  return t;
+}
+
+/* ---------- Bilder aus dem PDF ---------- */
+async function renderBox(p, box, cssW, maxPx = 2400) {
+  const page = await doc.getPage(p + 1);
+  const [x0, y0, x1, y1] = box;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  const scale = Math.min(cssW * dpr / (x1 - x0), maxPx / Math.max(x1 - x0, y1 - y0));
+  const c = document.createElement('canvas');
+  c.width = Math.ceil((x1 - x0) * scale); c.height = Math.ceil((y1 - y0) * scale);
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({canvasContext: ctx, viewport: page.getViewport({scale}), transform: [1, 0, 0, 1, -x0 * scale, -y0 * scale]}).promise;
+  return c;
+}
+const toBlob = (c, q = .85) => new Promise(r => c.toBlob(r, 'image/jpeg', q));
+const urlCache = new Map();
+// Vorschaubild einer Art: ganze Tafelseite einmal klein rendern und alle Arten darauf ausschneiden
+const plateJobs = new Map();
+async function thumbUrl(id) {
+  const s = IDX.species[id];
+  if (!s?.plate) return null;
+  if (urlCache.has('th' + id)) return urlCache.get('th' + id);
+  let b = await dbGet('img', 'th' + id);
+  if (!b) {
+    const pg = s.plate[0];
+    if (!plateJobs.has(pg)) plateJobs.set(pg, viaQueue(async () => {
+      const page = await doc.getPage(pg + 1);
+      const scale = 0.9;
+      const vp = page.getViewport({scale});
+      const c = document.createElement('canvas'); c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+      const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({canvasContext: ctx, viewport: vp}).promise;
+      for (const o of IDX.species.filter(o => o.plate && o.plate[0] === pg)) {
+        const [x0, y0, x1, y1] = o.plate[1];
+        const w = (x1 - x0) * scale, h = (y1 - y0) * scale, k = Math.min(1, 220 / Math.max(w, h));
+        const t = document.createElement('canvas'); t.width = Math.round(w * k); t.height = Math.round(h * k);
+        const tc = t.getContext('2d'); tc.fillStyle = '#fff'; tc.fillRect(0, 0, t.width, t.height);
+        tc.drawImage(c, x0 * scale, y0 * scale, w, h, 0, 0, t.width, t.height);
+        await dbPut('img', 'th' + o.id, await toBlob(t, .8));
+      }
+    }));
+    await plateJobs.get(pg);
+    b = await dbGet('img', 'th' + id);
+    if (!b) return null;
+  }
+  const u = URL.createObjectURL(b); urlCache.set('th' + id, u); return u;
+}
+function lazyThumbs(root = $main) {
+  const imgs = root.querySelectorAll('img[data-th]');
+  const io = new IntersectionObserver(es => es.forEach(e => {
+    if (!e.isIntersecting) return; io.unobserve(e.target);
+    thumbUrl(+e.target.dataset.th).then(u => { if (u) e.target.src = u; });
+  }), {rootMargin: '300px'});
+  imgs.forEach(i => io.observe(i));
+}
+async function glossCanvas(g, w = 76) { return viaQueue(() => renderBox(758, g.box, w)); }
+
+/* ---------- Zoom ---------- */
+const $zoom = document.getElementById('zoom'), $zin = document.getElementById('zoomin');
+$zoom.querySelector('.x').onclick = () => history.back();
+async function zoomBox(p, box) {
+  openZoom('<div class="spinner"></div>');
+  const c = await renderBox(p, box, Math.min(window.innerWidth * 2, 1600), 3600);
+  c.style.width = Math.min(window.innerWidth * 1.6, c.width / (window.devicePixelRatio || 1)) + 'px';
+  $zin.innerHTML = ''; $zin.append(c);
+}
+function zoomImg(src) { openZoom(`<img src="${esc(src)}" style="max-width:100%;margin-top:60px">`); }
+function openZoom(html) { $zin.innerHTML = html; $zoom.classList.add('on'); history.pushState({zoom: 1}, ''); }
+window.addEventListener('popstate', () => { if ($zoom.classList.contains('on')) { $zoom.classList.remove('on'); $zin.innerHTML = ''; } });
+
+/* ---------- Index ---------- */
+let IDX = null;
+let LAT = new Map();
+async function loadIndex() {
+  IDX = await (await fetch('kosmos-index.json')).json();
+  for (const s of IDX.species) {
+    s.q = norm(s.de + ' ' + s.lat + ' ' + (s.syn || []).join(' '));
+    LAT.set(norm(s.lat), s.id);
+    for (const y of s.syn || []) if (!LAT.has(norm(y))) LAT.set(norm(y), s.id);
+  }
+  IDX.keyOfStep = {};
+}
+const deName = s => s.de.split(',')[0];
+const RL = {'0': 'ausgestorben oder verschollen', '1': 'vom Aussterben bedroht', '2': 'stark gefährdet', '3': 'gefährdet', 'G': 'Gefährdung unbekannten Ausmaßes', 'R': 'extrem selten', 'V': 'Vorwarnliste', 'D': 'Daten unzureichend'};
+
+/* ---------- Supabase ---------- */
+const sb = SUPABASE_URL && window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {auth: {persistSession: true, autoRefreshToken: true}}) : null;
+let session = null, profile = null;
+async function initAuth() {
+  if (!sb) return;
+  const {data} = await sb.auth.getSession(); session = data.session;
+  sb.auth.onAuthStateChange((_e, s) => { session = s; if (s) { loadProfile(); sync(); } else profile = null; });
+  if (session) { loadProfile(); }
+}
+async function loadProfile() {
+  if (!sb || !session) return;
+  const {data} = await sb.from('profiles').select('*').eq('id', session.user.id).maybeSingle();
+  profile = data || {id: session.user.id, name: session.user.user_metadata?.name || ''};
+  store.set('profile', profile);
+}
+const myId = () => session?.user?.id;
+const signedCache = new Map();
+async function signUrls(paths) {
+  const need = [...new Set(paths)].filter(p => p && !signedCache.has(p));
+  if (need.length && sb && navigator.onLine) {
+    const {data} = await sb.storage.from('fotos').createSignedUrls(need, 60 * 60 * 6);
+    for (const d of data || []) if (d.signedUrl) signedCache.set(d.path, d.signedUrl);
+  }
+  return paths.map(p => signedCache.get(p) || '');
+}
+
+/* ---------- Funde: lokale Warteschlange + Sync ---------- */
+let syncing = false;
+async function sync() {
+  if (!sb || !session || syncing || !navigator.onLine) return;
+  syncing = true;
+  try {
+    const keys = await dbKeys('outbox');
+    for (const k of keys) {
+      const job = await dbGet('outbox', k);
+      if (!job) continue;
+      if (job.op === 'delete') {
+        if (job.fotos?.length) await sb.storage.from('fotos').remove(job.fotos);
+        const {error} = await sb.from('funde').delete().eq('id', job.id);
+        if (error) throw error;
+      } else {
+        const paths = [...(job.row.fotos || [])];
+        for (let i = 0; i < (job.neu || []).length; i++) {
+          const path = `${myId()}/${job.id}/${Date.now().toString(36)}-${i}.jpg`;
+          const {error} = await sb.storage.from('fotos').upload(path, job.neu[i], {contentType: 'image/jpeg', upsert: true});
+          if (error) throw error;
+          paths.push(path);
+        }
+        if (job.weg?.length) await sb.storage.from('fotos').remove(job.weg);
+        const row = {...job.row, id: job.id, fotos: paths, updated_at: new Date().toISOString()};
+        delete row.user_id;
+        const {error} = await sb.from('funde').upsert(row);
+        if (error) throw error;
+      }
+      await dbDel('outbox', k);
+    }
+  } catch (e) { console.warn('Sync fehlgeschlagen', e); }
+  finally { syncing = false; }
+}
+window.addEventListener('online', sync);
+async function pendingCount() { return (await dbKeys('outbox')).length; }
+
+/* ---------- Ansichten ---------- */
+let viewToken = 0;
+function setView(title, html, tab) {
+  $title.textContent = title; $main.innerHTML = html; window.scrollTo(0, 0);
+  document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('on', a.dataset.t === tab));
+}
+const spinner = '<div class="spinner"></div>';
+document.getElementById('back').onclick = () => { if (location.hash && location.hash !== '#/') history.back(); };
+let fs = store.get('fs', 16);
+document.documentElement.style.setProperty('--fs', fs + 'px');
+document.getElementById('fsz').onclick = () => { fs = fs >= 22 ? 14 : fs + 2; store.set('fs', fs); document.documentElement.style.setProperty('--fs', fs + 'px'); };
+
+function spItem(s, extra = '') {
+  return `<li><a class="item" href="#/art/${s.id}"><img class="th" data-th="${s.id}" alt="">
+    <span class="txt"><div class="de">${esc(deName(s))}${s.rl ? `<span class="badge">RL ${esc(s.rl)}</span>` : ''}${s.prot ? '<span class="badge">§</span>' : ''}</div>
+    <div class="lat">${esc(s.lat)}</div>${extra}</span></a></li>`;
+}
+
+/* Start */
+async function viewHome() {
+  const pend = sb && session ? await pendingCount() : 0;
+  const prog = store.get('ftProgress', 0);
+  setView('Pilzhandbuch', `
+    <a class="btn primary" href="#/k/0/1"><b>🔑 Pilz bestimmen</b></a>
+    <div class="row">
+      <a class="btn" href="#/arten"><b>📖 Arten</b><small>${IDX.species.length} Arten suchen</small></a>
+      <a class="btn" href="#/merkmale"><b>✏️ Merkmale</b><small>Hutformen, Lamellen …</small></a>
+    </div>
+    <div class="sect">Schlüssel direkt</div>
+    <div>${IDX.keys.filter(k => k.id > 0).map(k => `<a class="chip" href="#/k/${k.id}/1">${esc(k.title)}</a>`).join('')}</div>
+    <div class="sect">Funde der Community</div>
+    <div class="row">
+      <a class="btn" href="#/fund/neu"><b>＋ Neuer Fund</b><small>Mit Standort und Fotos</small></a>
+      <a class="btn" href="#/funde"><b>📍 Alle Funde</b><small>Liste und Karte</small></a>
+    </div>
+    ${pend ? `<div class="sync">${pend} Änderung(en) warten auf Netz und werden automatisch hochgeladen.</div>` : ''}
+    ${!sb ? '<div class="note">Die Fund-Datenbank ist noch nicht eingerichtet.</div>' : !session ? '<div class="note">Für Funde brauchst du ein Konto: <a href="#/konto">Anmelden oder registrieren</a></div>' : ''}
+    <div class="sect">Volltextsuche</div>
+    <div id="ft">${prog >= 1 ? '<div class="tiny">Alle Artbeschreibungen sind für die Suche vorbereitet.</div>' : `<button class="btn" id="ftgo"><b>Volltextsuche vorbereiten</b><small>Liest einmalig alle Beschreibungen aus deinem PDF (dauert 1–3 Minuten).</small></button>`}</div>
+    <div class="sect">Buch</div>
+    <a class="btn" href="#/seite/758"><small>Abkürzungen & Merkmale (Innenklappe)</small></a>
+    <a class="btn" href="#/seite/30"><small>Buchseite öffnen …</small></a>
+    <p class="tiny">Begleit-App zum eBook „Das Kosmos Handbuch Pilze“ von Andreas Gminder und Peter Karasch (Kosmos 2023). Alle Texte und Bilder stammen aus deinem eigenen PDF und bleiben auf deinem Gerät. Die App ersetzt keine Pilzberatung: Vor dem Verzehr immer von Pilzsachverständigen prüfen lassen.</p>`, 'home');
+  const b = document.getElementById('ftgo'); if (b) b.onclick = () => buildFulltext(document.getElementById('ft'));
+}
+let ftRunning = false;
+async function buildFulltext(el) {
+  if (ftRunning) return; ftRunning = true;
+  const pages = [...new Set(IDX.species.map(s => s.p))];
+  const have = new Set(await dbKeys('txt'));
+  let i = 0;
+  const show = () => { if (el && el.isConnected) el.innerHTML = `<div class="tiny">Lese Beschreibungen … ${Math.round(i / pages.length * 100)} %</div><div class="prog"><div style="width:${i / pages.length * 100}%"></div></div>`; };
+  for (const p of pages) {
+    const sps = IDX.species.filter(s => s.p === p && !have.has('sp:' + s.id));
+    if (sps.length) {
+      const it = await viaQueue(() => pageItems(doc, p));
+      for (const s of sps) await dbPut('txt', 'sp:' + s.id, speciesText(it, s));
+    }
+    i++; if (i % 3 === 0) { show(); store.set('ftProgress', i / pages.length); await sleep(0); }
+  }
+  store.set('ftProgress', 1); ftRunning = false;
+  if (el && el.isConnected) el.innerHTML = '<div class="tiny">Fertig: Die Suche unter „Arten“ durchsucht jetzt auch alle Beschreibungen.</div>';
+}
+
+/* Artenliste */
+async function viewArten(q0 = '') {
+  const ftReady = store.get('ftProgress', 0) >= 1;
+  setView('Arten', `
+    <input type="search" class="inp" id="q" placeholder="Name, lateinisch${ftReady ? ' oder Merkmal (z. B. Anisgeruch)' : ''} …" value="${esc(q0)}" autocomplete="off">
+    <div id="filters"></div><div id="res"></div>`, 'arten');
+  const qi = document.getElementById('q'), res = document.getElementById('res');
+  const secs = [...new Set(IDX.species.map(s => s.sec))];
+  let sec = store.get('artsec', '');
+  const fl = document.getElementById('filters');
+  const drawF = () => { fl.innerHTML = ['', ...secs].map(x => `<button class="chip ${x === sec ? 'on' : ''}" data-s="${esc(x)}">${esc(x || 'Alle')}</button>`).join(''); fl.querySelectorAll('[data-s]').forEach(b => b.onclick = () => { sec = b.dataset.s; store.set('artsec', sec); drawF(); draw(); }); };
+  let texts = null;
+  const draw = async () => {
+    const t = norm(qi.value).split(' ').filter(Boolean);
+    history.replaceState(null, '', '#/arten' + (qi.value ? '?q=' + encodeURIComponent(qi.value) : ''));
+    let xs = IDX.species.filter(s => !sec || s.sec === sec);
+    let ftHits = [];
+    if (t.length) {
+      const nameHits = xs.filter(s => t.every(w => s.q.includes(w)));
+      if (ftReady && qi.value.trim().length >= 3) {
+        texts ||= new Map((await Promise.all(IDX.species.map(async s => [s.id, (await dbGet('txt', 'sp:' + s.id))?.text || '']))).map(([k, v]) => [k, norm(v)]));
+        const nh = new Set(nameHits.map(s => s.id));
+        ftHits = xs.filter(s => !nh.has(s.id) && t.every(w => texts.get(s.id).includes(w)));
+      }
+      xs = nameHits;
+    }
+    let html = '';
+    if (!t.length) {
+      let last = null;
+      for (const s of xs) { const g = s.sec + (s.sub ? ' · ' + s.sub : ''); if (g !== last) { html += `${last ? '</ul>' : ''}<div class="sect">${esc(g)}</div><ul class="list">`; last = g; } html += spItem(s); }
+      html += '</ul>';
+    } else {
+      html = `<ul class="list">${xs.slice(0, 200).map(s => spItem(s)).join('')}</ul>`;
+      if (ftHits.length) html += `<div class="sect">Im Beschreibungstext (${ftHits.length})</div><ul class="list">${ftHits.slice(0, 150).map(s => spItem(s, `<div class="tiny">${snippet(texts.get(s.id), t)}</div>`)).join('')}</ul>`;
+      if (!xs.length && !ftHits.length) html = `<div class="note">Nichts gefunden.${ftReady ? '' : ' Tipp: Auf der Startseite die Volltextsuche vorbereiten, dann findest du auch Merkmale.'}</div>`;
+    }
+    res.innerHTML = html; lazyThumbs(res);
+  };
+  let tm; qi.oninput = () => { clearTimeout(tm); tm = setTimeout(draw, 180); };
+  drawF(); draw();
+}
+function snippet(text, words) {
+  const i = text.indexOf(words[0]); if (i < 0) return '';
+  return '… ' + esc(text.slice(Math.max(0, i - 40), i + 70)) + ' …';
+}
+
+/* Art */
+async function viewArt(id) {
+  const s = IDX.species[id]; if (!s) return viewHome();
+  const tok = ++viewToken;
+  setView(deName(s), `<div class="art">
+    <div class="tiny">${esc(s.sec)}${s.sub ? ' · ' + esc(s.sub) : ''} · S. ${s.p}</div>
+    <h2>${esc(s.de)}</h2>
+    <div class="latn">${esc(s.lat)}${s.syn?.length ? ` <span class="tiny">(Syn. ${esc(s.syn.join(', '))})</span>` : ''}</div>
+    <div style="margin-top:6px"><span id="icons"></span>
+      ${s.rl ? `<span class="badge" title="Rote Liste">RL ${esc(s.rl)}</span> <span class="tiny">${esc(RL[s.rl] || '')}</span>` : ''}
+      ${s.prot ? '<span class="badge">§</span> <span class="tiny">gesetzlich geschützt</span>' : ''}</div>
+    <div id="plate">${s.plate ? '<div class="spinner"></div>' : ''}</div>
+    <div class="btext" id="txt">${spinner}</div>
+    <div class="row"><a class="btn center" href="#/fund/neu/${s.id}"><b>＋ Fund speichern</b></a><a class="btn center" href="#/seite/${s.p}"><b>Buchseite</b></a></div>
+    <div id="artfunde"></div>
+    <div class="row">${id > 0 ? `<a class="btn center" href="#/art/${id - 1}">‹ ${esc(deName(IDX.species[id - 1]))}</a>` : ''}${id < IDX.species.length - 1 ? `<a class="btn center" href="#/art/${id + 1}">${esc(deName(IDX.species[id + 1]))} ›</a>` : ''}</div>
+  </div>`, 'arten');
+  // Symbole (Speisewert, Lebensweise) als Ausschnitt aus dem Buch
+  viaQueue(() => renderBox(s.p, [287, s.hdr[1] - 2, 348, s.hdr[3] + 2], 64)).then(c => { if (tok !== viewToken) return; c.className = 'icons'; c.style.height = '34px'; c.style.width = 'auto'; document.getElementById('icons')?.append(c); });
+  if (s.plate) viaQueue(() => renderBox(s.plate[0], s.plate[1], Math.min(window.innerWidth - 28, 700))).then(c => {
+    if (tok !== viewToken) return;
+    c.className = 'plate'; c.style.width = '100%'; c.style.height = 'auto';
+    c.onclick = () => zoomBox(s.plate[0], s.plate[1]);
+    const el = document.getElementById('plate'); el.innerHTML = ''; el.append(c);
+  });
+  const t = await spText(id);
+  if (tok !== viewToken) return;
+  document.getElementById('txt').innerHTML = linkLatin(t.html, s);
+  artFunde(s, tok);
+}
+function linkLatin(html, s) {
+  const genus = s.lat.split(' ')[0];
+  return html.replace(/<i>([^<]+)<\/i>/g, (m, inner) => {
+    const txt = inner.trim();
+    let id = LAT.get(norm(txt));
+    if (id == null) {
+      const mm = txt.match(/^([A-Z][a-z]*)\.\s*([a-z-]+)/);
+      if (mm) {
+        const cands = IDX.species.filter(o => o.lat.startsWith(mm[1]) && norm(o.lat).split(' ')[1] === norm(mm[2]));
+        id = (cands.find(o => o.lat.startsWith(genus + ' ')) || cands[0])?.id;
+      } else {
+        const full = IDX.species.find(o => norm(o.lat).startsWith(norm(txt)) && norm(txt).split(' ').length >= 2);
+        id = full?.id;
+      }
+    }
+    return id != null && id !== s.id ? `<a class="ref" href="#/art/${id}"><i>${inner}</i></a>` : m;
+  });
+}
+
+/* Schlüssel */
+function parseTrail(str) { return (str || '').split('~').filter(Boolean).map(x => { const [k, st, l] = x.split('.'); return {k: +k, s: +st, l}; }); }
+const trailStr = tr => tr.map(t => `${t.k}.${t.s}.${t.l}`).join('~');
+const GLOSS_SKIP = new Set(['glatt', 'breit', 'schmal', 'hohl', 'doppelt', 'frei', 'kraus', 'gezont']);
+function glossFor(text) {
+  const t = ' ' + norm(text) + ' ';
+  const hits = [];
+  for (const g of [...IDX.gloss].sort((a, b) => b.t.length - a.t.length)) {
+    if (GLOSS_SKIP.has(g.t)) continue;
+    const n = norm(g.t.replace(/\(.*\)/, ''));
+    const pos = t.indexOf(' ' + n + ' ');
+    if (pos >= 0 && !t.slice(Math.max(0, pos - 12), pos).includes('nicht') && !hits.some(h => norm(h.t).includes(n))) hits.push(g);
+    if (hits.length >= 4) break;
+  }
+  return hits;
+}
+async function viewKey(kid, step, trailS) {
+  const k = IDX.keys[kid]; if (!k) return viewHome();
+  const leads = k.steps[step]; if (!leads) return viewKey(kid, 1, trailS);
+  const trail = parseTrail(trailS);
+  const tok = ++viewToken;
+  const trailHtml = trail.map((t, i) => {
+    const pre = (i === 0 ? t.k !== kid || trail.some(x => x.k !== t.k) : trail[i - 1].k !== t.k) ? esc(IDX.keys[t.k].title.split(/[ ,]/)[0]) + ' ' : '';
+    return `<a class="chip" href="#/k/${t.k}/${t.s}/${trailStr(trail.slice(0, i))}">${pre}${t.s}${t.l}</a>`;
+  }).join('<span class="muted">›</span>');
+  const curPre = trail.length && trail[trail.length - 1].k !== kid ? esc(k.title.split(/[ ,]/)[0]) + ' ' : '';
+  setView(k.title, `
+    <div class="trail">${trailHtml}${trail.length ? '<span class="muted">›</span>' : ''}<span class="chip on">${curPre}${step}</span></div>
+    <div class="tiny">${esc(k.title)} · Schritt ${step} · S. ${leads[0].p}</div>
+    <div id="leads">${leads.map((l, i) => `<div class="card lead" data-i="${i}"><span class="ll">${step}${l.l}</span><div class="lt">${spinner}</div><div class="gl"></div><div class="ex"></div><div class="go"></div></div>`).join('')}</div>
+    <div class="row"><a class="btn center" href="#/seite/${leads[0].p}">Schlüsselseite im Buch</a>${kid !== 0 ? `<a class="btn center" href="#/k/${kid}/1">Neu beginnen</a>` : ''}</div>`, 'k');
+  const cards = $main.querySelectorAll('.lead');
+  leads.forEach(async (l, i) => {
+    const card = cards[i];
+    const t = await ldText(kid, step, l);
+    if (tok !== viewToken) return;
+    card.querySelector('.lt').innerHTML = t.html;
+    const nextTrail = trailStr([...trail, {k: kid, s: step, l: l.l}]);
+    const links = [];
+    for (const g of l.go) {
+      if (g.s != null) links.push({href: `#/k/${kid}/${g.s}/${nextTrail}`, label: `weiter zu ${g.s}`});
+      else if (g.k != null) links.push({href: `#/k/${g.k}/1/${nextTrail}`, label: `Schlüssel ${IDX.keys[g.k].title}`});
+      else if (g.sp) {
+        if (g.sp.length === 1) links.push({href: `#/art/${g.sp[0]}`, label: deName(IDX.species[g.sp[0]])});
+        else links.push({href: `#/liste/${g.sp.join(',')}/${encodeURIComponent((t.text.split('→').pop() || '').replace(/,?\s*S\.\s*\d+.*/, '').trim())}`, label: `${g.sp.length} Arten ansehen`});
+      }
+    }
+    const go = card.querySelector('.go');
+    if (!links.length) { card.classList.add('leaf'); go.innerHTML = '<span class="tiny">Diese Art wird im Buch nicht ausführlich beschrieben.</span>'; }
+    else if (links.length === 1) { card.onclick = e => { if (!e.target.closest('a,figure')) location.hash = links[0].href; }; go.innerHTML = `<a class="chip on" href="${links[0].href}">${esc(links[0].label)} ›</a>`; }
+    else go.innerHTML = links.map(x => `<a class="chip on" href="${x.href}">${esc(x.label)} ›</a>`).join('');
+    // Beispielarten
+    if (l.ex?.length) {
+      card.querySelector('.ex').innerHTML = l.ex.map(id => `<a href="#/art/${id}"><img data-th="${id}" alt="">${esc(deName(IDX.species[id]))}</a>`).join('') + (l.cnt > 1 ? `<span class="tiny" style="align-self:center;flex:0 0 auto">führt zu ${l.cnt} Arten</span>` : '');
+      lazyThumbs(card);
+    }
+    // Merkmalszeichnungen
+    const gs = glossFor(t.text);
+    const glEl = card.querySelector('.gl');
+    for (const g of gs) {
+      const f = document.createElement('figure'); f.innerHTML = '<div style="width:76px;height:60px"></div>'; f.title = g.t; f.setAttribute('aria-label', 'Zeichnung: ' + g.t); glEl.append(f);
+      f.onclick = e => { e.stopPropagation(); zoomBox(758, g.box); };
+      glossCanvas(g).then(c => { if (tok === viewToken) f.firstChild.replaceWith(c); });
+    }
+  });
+}
+async function viewListe(ids, title) {
+  const xs = ids.split(',').map(Number).map(i => IDX.species[i]).filter(Boolean);
+  setView(title || 'Ergebnis', `<div class="tiny">${xs.length} Arten aus diesem Zweig des Schlüssels</div><ul class="list">${xs.map(s => spItem(s)).join('')}</ul>`, 'k');
+  lazyThumbs();
+}
+
+/* Merkmale */
+function viewMerkmale() {
+  const cats = [...new Set(IDX.gloss.map(g => g.cat))];
+  setView('Merkmale', cats.map(c => `<div class="sect">${esc(c)}</div><div class="gloss-grid">${IDX.gloss.map((g, i) => [g, i]).filter(([g]) => g.cat === c).map(([g, i]) => `<figure data-g="${i}" aria-label="${esc(g.t)}"><div style="height:76px"></div></figure>`).join('')}</div>`).join('') +
+    '<a class="btn center" href="#/seite/758">Ganze Seite ansehen</a>', 'home');
+  const tok = ++viewToken;
+  $main.querySelectorAll('[data-g]').forEach(f => {
+    const g = IDX.gloss[+f.dataset.g];
+    f.onclick = () => zoomBox(758, g.box);
+    glossCanvas(g, 100).then(c => { if (tok === viewToken) f.firstChild.replaceWith(c); });
+  });
+}
+
+/* Buchseite */
+async function viewSeite(p) {
+  p = Math.max(0, Math.min(IDX.fp.pages - 1, p));
+  setView('Seite ' + p, `<div class="row"><a class="btn center" href="#/seite/${p - 1}">‹ ${p - 1}</a><a class="btn center" href="#/seite/${p + 1}">${p + 1} ›</a></div>
+    <div class="pagewrap" id="pg">${spinner}</div><p class="tiny">Tippen zum Vergrößern.</p>`, 'home');
+  const tok = ++viewToken;
+  const page = await doc.getPage(p + 1);
+  const box = [0, 0, page.view[2], page.view[3]];
+  const c = await viaQueue(() => renderBox(p, box, Math.min(window.innerWidth - 28, 700)));
+  if (tok !== viewToken) return;
+  c.style.width = '100%'; c.onclick = () => zoomBox(p, box);
+  const el = document.getElementById('pg'); el.innerHTML = ''; el.append(c);
+}
+
+/* Konto */
+async function viewKonto() {
+  if (!sb) return setView('Konto', '<div class="note">Die Fund-Datenbank ist noch nicht eingerichtet.</div>', 'konto');
+  if (!session) {
+    const mode = store.get('authmode', 'login');
+    setView('Konto', `
+      <div><button class="chip ${mode === 'login' ? 'on' : ''}" data-m="login">Anmelden</button><button class="chip ${mode === 'reg' ? 'on' : ''}" data-m="reg">Registrieren</button></div>
+      <div class="card">
+        ${mode === 'reg' ? '<label class="tiny">Name (sehen die anderen bei deinen Funden)</label><input class="inp" id="name" autocomplete="nickname">' : ''}
+        <label class="tiny">E-Mail</label><input class="inp" id="mail" type="email" autocomplete="email">
+        <label class="tiny">Passwort${mode === 'reg' ? ' (mindestens 8 Zeichen)' : ''}</label><input class="inp" id="pw" type="password" autocomplete="${mode === 'reg' ? 'new-password' : 'current-password'}">
+        <button class="btn primary" id="go">${mode === 'reg' ? 'Konto anlegen' : 'Anmelden'}</button>
+        ${mode === 'login' ? '<button class="btn center" id="reset"><small>Passwort vergessen?</small></button>' : ''}
+        <div id="msg" class="tiny"></div>
+      </div>
+      <p class="tiny">Alle angemeldeten Mitglieder sehen alle Funde mit genauem Standort, Fotos und Namen.</p>`, 'konto');
+    $main.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { store.set('authmode', b.dataset.m); viewKonto(); });
+    const msg = document.getElementById('msg');
+    document.getElementById('go').onclick = async () => {
+      const email = document.getElementById('mail').value.trim(), password = document.getElementById('pw').value;
+      msg.textContent = '…';
+      if (mode === 'reg') {
+        const name = document.getElementById('name').value.trim();
+        if (!name) return msg.textContent = 'Bitte einen Namen angeben.';
+        if (password.length < 8) return msg.textContent = 'Das Passwort braucht mindestens 8 Zeichen.';
+        const {data, error} = await sb.auth.signUp({email, password, options: {data: {name}, emailRedirectTo: location.origin + location.pathname}});
+        if (error) return msg.textContent = 'Fehler: ' + error.message;
+        if (!data.session) msg.textContent = 'Fast geschafft: Bitte bestätige deine E-Mail-Adresse über den Link, den du gleich bekommst. Danach kannst du dich hier anmelden.';
+        else location.hash = '#/funde';
+      } else {
+        const {error} = await sb.auth.signInWithPassword({email, password});
+        if (error) return msg.textContent = error.message.includes('Invalid') ? 'E-Mail oder Passwort stimmt nicht.' : 'Fehler: ' + error.message;
+        location.hash = '#/funde';
+      }
+    };
+    const r = document.getElementById('reset');
+    if (r) r.onclick = async () => {
+      const email = document.getElementById('mail').value.trim();
+      if (!email) return msg.textContent = 'Bitte zuerst die E-Mail-Adresse eintragen.';
+      const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo: location.origin + location.pathname + '#/konto'});
+      msg.textContent = error ? 'Fehler: ' + error.message : 'Wenn es ein Konto gibt, kommt gleich eine E-Mail mit einem Link.';
+    };
+    return;
+  }
+  await loadProfile();
+  const pend = await pendingCount();
+  setView('Konto', `<div class="card">
+      <div class="tiny">Angemeldet als ${esc(session.user.email)}</div>
+      <label class="tiny">Dein Name</label><input class="inp" id="name" value="${esc(profile?.name || '')}">
+      <button class="btn center" id="save">Name speichern</button>
+      <label class="tiny">Neues Passwort</label><input class="inp" id="pw" type="password" autocomplete="new-password">
+      <button class="btn center" id="pwsave">Passwort ändern</button>
+      <div id="msg" class="tiny"></div></div>
+    ${pend ? `<div class="sync">${pend} Änderung(en) noch nicht hochgeladen. <button class="chip" id="syncnow">Jetzt hochladen</button></div>` : ''}
+    <button class="btn center" id="out">Abmelden</button>
+    <div class="sect">Buch auf diesem Gerät</div>
+    <button class="btn center danger" id="rmpdf"><small>PDF von diesem Gerät entfernen</small></button>`, 'konto');
+  const msg = document.getElementById('msg');
+  document.getElementById('save').onclick = async () => {
+    const name = document.getElementById('name').value.trim(); if (!name) return;
+    const {error} = await sb.from('profiles').update({name}).eq('id', myId());
+    msg.textContent = error ? 'Fehler: ' + error.message : 'Gespeichert.';
+  };
+  document.getElementById('pwsave').onclick = async () => {
+    const pw = document.getElementById('pw').value; if (pw.length < 8) return msg.textContent = 'Mindestens 8 Zeichen.';
+    const {error} = await sb.auth.updateUser({password: pw}); msg.textContent = error ? 'Fehler: ' + error.message : 'Passwort geändert.';
+  };
+  const sn = document.getElementById('syncnow'); if (sn) sn.onclick = async () => { await sync(); viewKonto(); };
+  document.getElementById('out').onclick = async () => { await sb.auth.signOut(); session = null; viewKonto(); };
+  document.getElementById('rmpdf').onclick = async () => { if (!confirm('Das Buch-PDF und alle daraus gelesenen Texte von diesem Gerät löschen? Deine Funde bleiben erhalten.')) return; await removePdf(); location.hash = '#/'; location.reload(); };
+}
+
+/* Funde */
+const needLogin = title => setView(title, !sb ? '<div class="note">Die Fund-Datenbank ist noch nicht eingerichtet.</div>' : '<div class="note">Für Funde brauchst du ein Konto.</div><a class="btn primary" href="#/konto">Anmelden oder registrieren</a>', 'funde');
+function fundName(f) { return f.art_id != null && IDX.species[f.art_id] ? deName(IDX.species[f.art_id]) : (f.art_frei || 'Unbestimmt'); }
+async function fetchFunde(filter = {}) {
+  let q = sb.from('funde').select('*, profiles(name), kommentare(count)').order('datum', {ascending: false}).order('created_at', {ascending: false}).limit(500);
+  if (filter.user) q = q.eq('user_id', filter.user);
+  if (filter.art != null) q = q.eq('art_id', filter.art);
+  const {data, error} = await q;
+  if (error) throw error;
+  return data;
+}
+async function localPending() {
+  const out = [];
+  for (const j of await dbAll('outbox')) if (j.op !== 'delete') out.push({...j.row, id: j.id, _pending: true, profiles: {name: profile?.name || 'Ich'}, kommentare: [{count: 0}], _neu: j.neu?.length || 0});
+  return out;
+}
+async function fundListHtml(fs) {
+  const firsts = await signUrls(fs.map(f => f.fotos?.[0]).filter(Boolean));
+  const m = new Map(fs.map(f => f.fotos?.[0]).filter(Boolean).map((p, i) => [p, firsts[i]]));
+  return `<ul class="list">${fs.map(f => {
+    const src = f.fotos?.[0] ? m.get(f.fotos[0]) : (f.art_id != null ? null : null);
+    const thumb = src ? `<img class="th cover" src="${esc(src)}" alt="">` : f.art_id != null && IDX.species[f.art_id]?.plate ? `<img class="th" data-th="${f.art_id}" alt="">` : '<span class="th" style="display:flex;align-items:center;justify-content:center;font-size:24px">📍</span>';
+    const nk = f.kommentare?.[0]?.count || 0;
+    return `<li><a class="item" href="#/fund/${f.id}">${thumb}<span class="txt"><div class="de">${esc(fundName(f))}${f.unsicher ? ' <span class="tiny">(unsicher)</span>' : ''}</div>
+      <div class="tiny">${fmtDate(f.datum)} · ${esc(f.profiles?.name || '')}${f.ort ? ' · ' + esc(f.ort) : ''}${nk ? ` · 💬 ${nk}` : ''}${f._pending ? ' · ⏳ noch nicht hochgeladen' : ''}</div></span></a></li>`;
+  }).join('')}</ul>`;
+}
+async function viewFunde(tab = 'alle') {
+  if (!sb || !session) return needLogin('Funde');
+  const tok = ++viewToken;
+  setView('Funde', `<a class="btn primary" href="#/fund/neu">＋ Neuer Fund</a>
+    <div>${[['alle', 'Alle'], ['meine', 'Meine'], ['karte', 'Karte']].map(([k, l]) => `<a class="chip ${k === tab ? 'on' : ''}" href="#/funde/${k}">${l}</a>`).join('')}</div>
+    <div id="fl">${spinner}</div>`, 'funde');
+  sync();
+  let fs;
+  try { fs = await fetchFunde(tab === 'meine' ? {user: myId()} : {}); await dbPut('cache', 'funde-' + tab, fs); }
+  catch (e) { fs = await dbGet('cache', 'funde-' + tab) || []; if (tok === viewToken) document.getElementById('fl').insertAdjacentHTML('beforebegin', '<div class="note warn">Offline: Du siehst den zuletzt geladenen Stand.</div>'); }
+  const pend = await localPending();
+  const ids = new Set(pend.map(p => p.id));
+  fs = [...pend, ...fs.filter(f => !ids.has(f.id))];
+  if (tok !== viewToken) return;
+  const el = document.getElementById('fl');
+  if (tab === 'karte') return drawMap(el, fs);
+  el.innerHTML = fs.length ? await fundListHtml(fs) : '<div class="note">Noch keine Funde. Leg den ersten an!</div>';
+  lazyThumbs(el);
+}
+function drawMap(el, fs) {
+  const pts = fs.filter(f => f.lat != null && f.lon != null);
+  el.innerHTML = `<div id="map"></div><div class="tiny">${pts.length} Funde mit Standort. Kartendaten © OpenStreetMap-Mitwirkende.</div>`;
+  if (!window.L) { el.innerHTML = '<div class="note">Karte nicht verfügbar.</div>'; return; }
+  const map = L.map('map');
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
+  const ms = pts.map(f => L.marker([f.lat, f.lon]).addTo(map).bindPopup(`<b>${esc(fundName(f))}</b><br>${fmtDate(f.datum)} · ${esc(f.profiles?.name || '')}<br><a href="#/fund/${f.id}">Öffnen</a>`));
+  if (ms.length) map.fitBounds(L.featureGroup(ms).getBounds().pad(0.2), {maxZoom: 14}); else map.setView([51.48, 11.97], 9);
+}
+async function artFunde(s, tok) {
+  if (!sb || !session) return;
+  try {
+    const fs = await fetchFunde({art: s.id});
+    if (tok !== viewToken || !fs.length) return;
+    const el = document.getElementById('artfunde');
+    el.innerHTML = `<div class="sect">Funde aus der Community (${fs.length})</div>` + await fundListHtml(fs.slice(0, 20));
+  } catch {}
+}
+async function resizePhoto(file, max = 1600) {
+  const img = await createImageBitmap(file, {imageOrientation: 'from-image'}).catch(() => createImageBitmap(file));
+  const k = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return toBlob(c, .82);
+}
+async function viewFundEdit(fid, artId) {
+  if (!sb || !session) return needLogin('Neuer Fund');
+  const isNew = fid === 'neu';
+  let f;
+  if (isNew) f = {id: uuid(), art_id: Number.isFinite(artId) ? artId : null, art_frei: '', unsicher: false, datum: new Date().toISOString().slice(0, 10), lat: null, lon: null, genauigkeit: null, ort: '', notiz: '', fotos: []};
+  else {
+    const job = await dbGet('outbox', fid);
+    if (job && job.op !== 'delete') f = {...job.row, id: fid, _neu: job.neu || []};
+    else { const {data} = await sb.from('funde').select('*').eq('id', fid).maybeSingle(); f = data; }
+    if (!f) return viewFunde();
+    if (f.user_id && f.user_id !== myId()) return viewFund(fid);
+  }
+  let neu = [...(f._neu || [])], weg = [], fotos = [...(f.fotos || [])];
+  setView(isNew ? 'Neuer Fund' : 'Fund bearbeiten', `
+    <div class="sect">Art</div>
+    <div id="artsel" class="card" style="margin-top:0"></div>
+    <input type="search" class="inp" id="artq" placeholder="Art suchen …" autocomplete="off" style="position:static">
+    <div id="artres"></div>
+    <label class="tiny"><input type="checkbox" id="uns" ${f.unsicher ? 'checked' : ''}> Bestimmung unsicher</label>
+    <div class="sect">Datum</div><input type="date" id="datum" class="inp" value="${esc(f.datum)}">
+    <div class="sect">Standort</div>
+    <button class="btn center" id="gps">📍 Aktuellen Standort übernehmen</button>
+    <div id="gpsinfo" class="tiny"></div>
+    <input type="text" id="ort" class="inp" placeholder="Ortsbeschreibung, z. B. Dölauer Heide, Nordrand" value="${esc(f.ort || '')}">
+    <div class="sect">Notiz</div>
+    <textarea id="notiz" rows="4" class="inp" placeholder="Bäume in der Nähe, Geruch, Anzahl, Bestimmungsmerkmale …">${esc(f.notiz || '')}</textarea>
+    <div class="sect">Fotos</div>
+    <div class="ph-edit" id="phs"></div>
+    <label class="btn center">📷 Foto aufnehmen oder wählen<input type="file" id="foto" accept="image/*" multiple hidden></label>
+    <button class="btn primary" id="save">Speichern</button>
+    ${isNew ? '' : '<button class="btn center danger" id="del">Fund löschen</button>'}
+    <p class="tiny">Alle Mitglieder sehen diesen Fund mit genauem Standort, Fotos und deinem Namen.</p>`, 'funde');
+  const showArt = () => {
+    const s = f.art_id != null ? IDX.species[f.art_id] : null;
+    document.getElementById('artsel').innerHTML = s ? `<div class="de">${esc(s.de)}</div><div class="lat">${esc(s.lat)}</div><button class="chip" id="artclr">Entfernen</button>`
+      : f.art_frei ? `<div class="de">${esc(f.art_frei)}</div><div class="tiny">nicht im Buch</div><button class="chip" id="artclr">Entfernen</button>` : '<div class="de">Noch unbestimmt</div><div class="tiny">Du kannst die Art auch später eintragen.</div>';
+    const c = document.getElementById('artclr'); if (c) c.onclick = () => { f.art_id = null; f.art_frei = ''; showArt(); };
+  };
+  showArt();
+  const aq = document.getElementById('artq'), ar = document.getElementById('artres');
+  aq.oninput = () => {
+    const t = norm(aq.value).split(' ').filter(Boolean);
+    if (aq.value.trim().length < 2) { ar.innerHTML = ''; return; }
+    const xs = IDX.species.filter(s => t.every(w => s.q.includes(w))).slice(0, 12);
+    ar.innerHTML = xs.map(s => `<button class="chip" data-a="${s.id}">${esc(deName(s))}</button>`).join('') + `<button class="chip" data-frei="1">„${esc(aq.value.trim())}“ (nicht im Buch)</button>`;
+    ar.querySelectorAll('[data-a]').forEach(b => b.onclick = () => { f.art_id = +b.dataset.a; f.art_frei = ''; aq.value = ''; ar.innerHTML = ''; showArt(); });
+    ar.querySelector('[data-frei]').onclick = () => { f.art_id = null; f.art_frei = aq.value.trim(); aq.value = ''; ar.innerHTML = ''; showArt(); };
+  };
+  const gi = document.getElementById('gpsinfo');
+  const showGps = () => gi.innerHTML = f.lat != null ? `Gespeichert: ${(+f.lat).toFixed(5)}, ${(+f.lon).toFixed(5)}${f.genauigkeit ? ` (± ${Math.round(f.genauigkeit)} m)` : ''} · <a href="geo:${f.lat},${f.lon}?q=${f.lat},${f.lon}">In Karten-App öffnen</a> · <a href="#" id="gpsclr">entfernen</a>` : 'Noch kein Standort gespeichert.';
+  showGps();
+  gi.onclick = e => { if (e.target.id === 'gpsclr') { e.preventDefault(); f.lat = f.lon = f.genauigkeit = null; showGps(); } };
+  document.getElementById('gps').onclick = () => {
+    if (!navigator.geolocation) return gi.textContent = 'Dieser Browser kann keinen Standort liefern.';
+    gi.textContent = 'Suche Standort …';
+    navigator.geolocation.getCurrentPosition(p => { f.lat = p.coords.latitude; f.lon = p.coords.longitude; f.genauigkeit = p.coords.accuracy; showGps(); },
+      e => gi.textContent = 'Kein Standort: ' + (e.code === 1 ? 'Zugriff verweigert. Bitte in den Browser-Einstellungen erlauben.' : e.message),
+      {enableHighAccuracy: true, timeout: 20000, maximumAge: 0});
+  };
+  const phs = document.getElementById('phs');
+  const drawPhotos = async () => {
+    const urls = await signUrls(fotos);
+    phs.innerHTML = fotos.map((p, i) => `<div><img src="${esc(urls[i])}" alt=""><button data-old="${i}" aria-label="Foto entfernen">×</button></div>`).join('') +
+      neu.map((b, i) => `<div><img src="${URL.createObjectURL(b)}" alt=""><button data-neu="${i}" aria-label="Foto entfernen">×</button></div>`).join('');
+    phs.querySelectorAll('[data-old]').forEach(b => b.onclick = () => { weg.push(fotos[+b.dataset.old]); fotos.splice(+b.dataset.old, 1); drawPhotos(); });
+    phs.querySelectorAll('[data-neu]').forEach(b => b.onclick = () => { neu.splice(+b.dataset.neu, 1); drawPhotos(); });
+  };
+  drawPhotos();
+  document.getElementById('foto').onchange = async e => { for (const file of e.target.files) neu.push(await resizePhoto(file)); e.target.value = ''; drawPhotos(); };
+  document.getElementById('save').onclick = async () => {
+    const row = {art_id: f.art_id, art_lat: f.art_id != null ? IDX.species[f.art_id].lat : null, art_de: f.art_id != null ? IDX.species[f.art_id].de : null, art_frei: f.art_frei || null,
+      unsicher: document.getElementById('uns').checked, datum: document.getElementById('datum').value || f.datum,
+      lat: f.lat, lon: f.lon, genauigkeit: f.genauigkeit, ort: document.getElementById('ort').value.trim() || null, notiz: document.getElementById('notiz').value.trim() || null, fotos};
+    const prev = await dbGet('outbox', f.id);
+    await dbPut('outbox', f.id, {op: 'upsert', id: f.id, row, neu, weg: [...(prev?.weg || []), ...weg], t: Date.now()});
+    await sync();
+    location.replace('#/fund/' + f.id);
+  };
+  const del = document.getElementById('del');
+  if (del) del.onclick = async () => {
+    if (!confirm('Diesen Fund wirklich löschen?')) return;
+    await dbPut('outbox', f.id, {op: 'delete', id: f.id, fotos: [...(f.fotos || []), ...weg]});
+    await sync(); location.replace('#/funde');
+  };
+}
+async function viewFund(fid) {
+  if (!sb || !session) return needLogin('Fund');
+  const tok = ++viewToken;
+  setView('Fund', spinner, 'funde');
+  let f = null, pend = false;
+  const job = await dbGet('outbox', fid);
+  if (job && job.op !== 'delete') { f = {...job.row, id: fid, user_id: myId(), profiles: {name: profile?.name || 'Ich'}}; pend = true; }
+  else { const {data} = await sb.from('funde').select('*, profiles(name)').eq('id', fid).maybeSingle().then(r => r, () => ({data: null})); f = data; }
+  if (!f) return setView('Fund', '<div class="note">Diesen Fund gibt es nicht (mehr).</div>', 'funde');
+  if (tok !== viewToken) return;
+  const s = f.art_id != null ? IDX.species[f.art_id] : null;
+  const urls = await signUrls(f.fotos || []);
+  const own = f.user_id === myId();
+  setView(fundName(f), `
+    <div class="card">
+      ${s ? `<a href="#/art/${s.id}" class="item" style="border:0;padding:0"><img class="th" data-th="${s.id}" alt=""><span class="txt"><div class="de">${esc(s.de)}</div><div class="lat">${esc(s.lat)}</div><div class="tiny">Im Buch öffnen ›</div></span></a>` : `<div class="de">${esc(fundName(f))}</div>`}
+      ${f.unsicher ? '<div class="note warn">Bestimmung unsicher</div>' : ''}
+      <div class="tiny" style="margin-top:8px">${fmtDate(f.datum)} · gefunden von ${esc(f.profiles?.name || '')}</div>
+      ${pend ? `<div class="sync">⏳ Wird hochgeladen, sobald Netz da ist${job.neu?.length ? ` (${job.neu.length} Foto(s))` : ''}.</div>` : ''}
+    </div>
+    ${urls.length ? `<div class="photos">${urls.map(u => `<img src="${esc(u)}" alt="">`).join('')}</div>` : ''}
+    ${f.lat != null ? `<div class="card"><b>Standort</b><div class="tiny">${(+f.lat).toFixed(5)}, ${(+f.lon).toFixed(5)}${f.genauigkeit ? ` (± ${Math.round(f.genauigkeit)} m)` : ''}</div>${f.ort ? `<div>${esc(f.ort)}</div>` : ''}<div class="row" style="margin-top:6px"><a class="btn center" href="geo:${f.lat},${f.lon}?q=${f.lat},${f.lon}">In Karten-App</a><a class="btn center" target="_blank" rel="noopener" href="https://www.openstreetmap.org/?mlat=${f.lat}&mlon=${f.lon}#map=16/${f.lat}/${f.lon}">OpenStreetMap</a></div></div>` : f.ort ? `<div class="card"><b>Ort</b><div>${esc(f.ort)}</div></div>` : ''}
+    ${f.notiz ? `<div class="card"><b>Notiz</b><div style="white-space:pre-wrap">${esc(f.notiz)}</div></div>` : ''}
+    ${own ? `<a class="btn center" href="#/fund/${f.id}/bearbeiten">Bearbeiten</a>` : ''}
+    <div class="sect">Kommentare</div><div id="kom">${pend ? '<div class="tiny">Kommentare gibt es, sobald der Fund hochgeladen ist.</div>' : spinner}</div>`, 'funde');
+  lazyThumbs();
+  $main.querySelectorAll('.photos img').forEach(i => i.onclick = () => zoomImg(i.src));
+  if (!pend) loadKommentare(f.id, tok);
+}
+async function loadKommentare(fid, tok) {
+  const el = document.getElementById('kom');
+  const {data, error} = await sb.from('kommentare').select('*, profiles(name)').eq('fund_id', fid).order('created_at');
+  if (tok !== viewToken) return;
+  if (error) { el.innerHTML = '<div class="tiny">Kommentare konnten nicht geladen werden.</div>'; return; }
+  el.innerHTML = data.map(k => `<div class="comment"><div class="tiny">${esc(k.profiles?.name || '')} · ${new Date(k.created_at).toLocaleDateString('de-DE')}${k.user_id === myId() ? ` · <a href="#" data-del="${k.id}">löschen</a>` : ''}</div><div style="white-space:pre-wrap">${esc(k.text)}</div></div>`).join('') +
+    `<textarea class="inp" id="ktext" rows="2" placeholder="Kommentar, z. B. Bestimmungshinweis …"></textarea><button class="btn center" id="ksend">Kommentar senden</button>`;
+  el.querySelectorAll('[data-del]').forEach(a => a.onclick = async e => { e.preventDefault(); await sb.from('kommentare').delete().eq('id', a.dataset.del); loadKommentare(fid, tok); });
+  document.getElementById('ksend').onclick = async () => {
+    const text = document.getElementById('ktext').value.trim(); if (!text) return;
+    const {error} = await sb.from('kommentare').insert({fund_id: fid, text});
+    if (error) return alert('Kommentar konnte nicht gespeichert werden: ' + error.message);
+    loadKommentare(fid, tok);
+  };
+}
+
+/* Einrichtung: eigenes PDF laden */
+function viewSetup(err) {
+  document.getElementById('tabs').hidden = true;
+  setView('Pilzhandbuch', `
+    <div class="card">
+      <h2 style="margin-top:0">Willkommen 🍄</h2>
+      <p>Diese App ist ein Begleiter zum eBook <b>„Das Kosmos Handbuch Pilze“</b> von Andreas Gminder und Peter Karasch (Kosmos, 2023). Sie bringt einen durchklickbaren Bestimmungsschlüssel, gut lesbare Artbeschreibungen, eine Suche und eine gemeinsame Fund-Datenbank für unsere Gruppe mit.</p>
+      <p>Die App selbst enthält <b>keine Buchinhalte</b>. Du brauchst dein eigenes, gekauftes eBook als PDF (erhältlich z. B. bei Kosmos, Thalia oder ebook.de, ca. 37 €). Die Datei wird nur auf deinem Gerät gespeichert und nirgendwohin hochgeladen. Bitte gib sie nicht weiter, sie trägt deine Käuferdaten.</p>
+      ${err ? `<div class="note warn">${esc(err)}</div>` : ''}
+      <label class="btn primary">PDF auswählen<input type="file" id="f" accept="application/pdf,.pdf" hidden></label>
+      <div id="st" class="tiny"></div>
+    </div>
+    <p class="tiny">Tipp: Danach im Browsermenü „Zum Startbildschirm hinzufügen“ wählen, dann funktioniert die App auch im Wald ohne Netz.</p>`, 'home');
+  document.getElementById('f').onchange = async e => {
+    const file = e.target.files[0]; if (!file) return;
+    const st = document.getElementById('st');
+    try {
+      st.innerHTML = 'Prüfe die Datei …';
+      const d = await openPdf(file);
+      const bad = await checkBook(d);
+      if (bad) { await d.destroy(); return viewSetup(bad); }
+      await d.destroy();
+      st.innerHTML = '<div>Speichere das Buch auf dem Gerät …</div><div class="prog"><div id="pp"></div></div>';
+      await savePdf(file, x => { const pp = document.getElementById('pp'); if (pp) pp.style.width = Math.round(x * 100) + '%'; });
+      try { await navigator.storage?.persist?.(); } catch {}
+      await start();
+    } catch (er) { console.error(er); viewSetup('Die Datei konnte nicht gelesen werden: ' + er.message); }
+  };
+}
+
+/* Router */
+async function route() {
+  if (!doc) return;
+  const [path, qs] = location.hash.slice(1).split('?');
+  const h = path.split('/').filter(Boolean);
+  const q = new URLSearchParams(qs || '');
+  ++viewToken;
+  switch (h[0]) {
+    case 'arten': return viewArten(q.get('q') || '');
+    case 'art': return viewArt(+h[1]);
+    case 'k': return viewKey(+h[1] || 0, +h[2] || 1, h[3] || '');
+    case 'liste': return viewListe(h[1], decodeURIComponent(h[2] || ''));
+    case 'merkmale': return viewMerkmale();
+    case 'seite': return viewSeite(+h[1] || 0);
+    case 'konto': return viewKonto();
+    case 'funde': return viewFunde(h[1] || 'alle');
+    case 'fund':
+      if (h[1] === 'neu') return viewFundEdit('neu', h[2] != null ? +h[2] : NaN);
+      if (h[2] === 'bearbeiten') return viewFundEdit(h[1]);
+      return viewFund(h[1]);
+    default: return viewHome();
+  }
+}
+window.addEventListener('hashchange', () => { if ($zoom.classList.contains('on')) { $zoom.classList.remove('on'); $zin.innerHTML = ''; } route(); });
+
+async function start() {
+  const blob = await loadPdfBlob();
+  if (!blob) return viewSetup();
+  try { doc = await openPdf(blob); }
+  catch (e) { console.error(e); return viewSetup('Das gespeicherte PDF konnte nicht geöffnet werden. Bitte wähle es noch einmal aus.'); }
+  document.getElementById('tabs').hidden = false;
+  route();
+  sync();
+}
+
+(async () => {
+  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+  await loadIndex();
+  await initAuth();
+  profile ||= store.get('profile', null);
+  await start();
+})();
