@@ -1,6 +1,7 @@
 import * as pdfjsLib from './vendor/pdf.min.mjs';
 import {pageItems, speciesText, leadText} from './book.js';
 import {SUPABASE_URL, SUPABASE_KEY} from './config.js';
+import {glossMatches} from './glossar.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
 
@@ -440,18 +441,18 @@ function linkLatin(html, s) {
 /* Schlüssel */
 function parseTrail(str) { return (str || '').split('~').filter(Boolean).map(x => { const [k, st, l] = x.split('.'); return {k: +k, s: +st, l}; }); }
 const trailStr = tr => tr.map(t => `${t.k}.${t.s}.${t.l}`).join('~');
-const GLOSS_SKIP = new Set(['glatt', 'breit', 'schmal', 'hohl', 'doppelt', 'frei', 'kraus', 'gezont']);
-function glossFor(text) {
-  const t = ' ' + norm(text) + ' ';
-  const hits = [];
-  for (const g of [...IDX.gloss].sort((a, b) => b.t.length - a.t.length)) {
-    if (GLOSS_SKIP.has(g.t)) continue;
-    const n = norm(g.t.replace(/\(.*\)/, ''));
-    const pos = t.indexOf(' ' + n + ' ');
-    if (pos >= 0 && !t.slice(Math.max(0, pos - 12), pos).includes('nicht') && !hits.some(h => norm(h.t).includes(n))) hits.push(g);
-    if (hits.length >= 4) break;
+const glossFor = text => glossMatches(text).map(i => IDX.gloss[i]).filter(Boolean);
+// Gruppenübersicht (Innenklappe, S. 759): Zeilen je Pilzgruppe
+const GROUP_ROWS = [[42, 100], [100, 155], [155, 210], [210, 265], [265, 320], [320, 375], [375, 430], [430, 485], [485, 537]];
+const GROUP_OF = [['Röhrlinge', 0], ['Blätterpilze', 1], ['Milchlinge', 2], ['Täublinge', 2], ['Porlinge', 3], ['Rindenpilze', 4], ['Nichtblätterpilze', 5], ['Gallertpilze', 5],
+  ['Bauchpilze', 6], ['Hypogäen', 6], ['Schlauchpilze', 7], ['Operculate', 7], ['Inoperculate', 7], ['Pyrenomyceten', 7], ['Phytoparasiten', 8]];
+function groupRow(l) {
+  for (const g of l.go) {
+    const name = g.k != null ? IDX.keys[g.k].title : g.sp ? IDX.species[g.sp[0]].sec : null;
+    const hit = name && GROUP_OF.find(([n]) => name.startsWith(n));
+    if (hit) return GROUP_ROWS[hit[1]];
   }
-  return hits;
+  return null;
 }
 async function viewKey(kid, step, trailS) {
   const k = IDX.keys[kid]; if (!k) return viewHome();
@@ -494,6 +495,14 @@ async function viewKey(kid, step, trailS) {
       lazyThumbs(card);
     }
     // Merkmalszeichnungen
+    if (kid <= 1) {
+      const row = groupRow(l);
+      if (row) viaQueue(() => renderBox(759, [52, row[0], 345, row[1]], 300)).then(c => {
+        if (tok !== viewToken) return;
+        c.style.cssText = 'width:100%;max-width:340px;height:auto;display:block;margin-top:8px;border-radius:8px;background:#fff';
+        card.querySelector('.gl').before(c);
+      });
+    }
     const gs = glossFor(t.text);
     const glEl = card.querySelector('.gl');
     for (const g of gs) {
@@ -593,6 +602,7 @@ async function viewKonto() {
     <div class="sect">Communitys</div>
     <div id="comms">${spinner}</div>
     <button class="btn center" id="newcomm">＋ Neue Community gründen</button>
+    <a class="btn center" href="#/import">Funde aus der Parey-App übernehmen</a>
     <div class="row" style="align-items:center"><input class="inp" id="joincode" placeholder="Einladungslink oder Code" style="flex:2;min-width:160px"><button class="btn center" id="join" style="flex:1">Beitreten</button></div>
     <button class="btn center" id="out">Abmelden</button>
     <div class="sect">Buch auf diesem Gerät</div>
@@ -854,6 +864,83 @@ async function loadKommentare(fid, tok) {
   };
 }
 
+/* Funde aus der Parey-App (gleiche Website paantones.github.io, darum lesbar) */
+async function oldDbFunde() {
+  if (indexedDB.databases) { const ds = await indexedDB.databases().catch(() => null); if (ds && !ds.some(d => d.name === 'pilzbuch')) return null; }
+  const db = await new Promise(res => { const r = indexedDB.open('pilzbuch'); r.onsuccess = () => res(r.result); r.onerror = () => res(null); });
+  if (!db) return null;
+  if (!db.objectStoreNames.contains('funde')) { db.close(); return null; }
+  const all = (s, kind) => new Promise(res => { try { const q = db.transaction(s).objectStore(s)[kind](); q.onsuccess = () => res(q.result || []); q.onerror = () => res([]); } catch { res([]); } });
+  const funde = await all('funde', 'getAll');
+  const fotos = new Map();
+  if (db.objectStoreNames.contains('fotos')) { const ks = await all('fotos', 'getAllKeys'), vs = await all('fotos', 'getAll'); ks.forEach((k, i) => fotos.set(k, vs[i])); }
+  db.close();
+  return funde.map(f => ({...f, _foto: fotos.get(f.id) || null}));
+}
+async function pareyData() {
+  const [js, map] = await Promise.all([fetch('../pilzbuch/data.js').then(r => r.ok ? r.text() : ''), fetch('parey-map.json').then(r => r.json())]);
+  const A = js ? JSON.parse(js.slice(js.indexOf('{'), js.lastIndexOf('}') + 1)).arten : [];
+  return {A, map};
+}
+async function viewImport() {
+  if (!sb || !session) return needLogin('Funde übernehmen');
+  setView('Funde übernehmen', spinner, 'funde');
+  await loadComms();
+  let funde = await oldDbFunde().catch(() => null), quelle = 'app';
+  const {A, map} = await pareyData().catch(() => ({A: [], map: {}}));
+  const done = new Set(store.get('importiert', []));
+  const draw = () => {
+    const rows = (funde || []).map((f, i) => {
+      const p = f.art != null ? A[f.art] : null, kid = f.art != null ? map[f.art] : undefined;
+      const k = kid != null ? IDX.species[kid] : null;
+      f._kid = kid; f._frei = !k && p ? `${p.de.split(',')[0]} (${p.lat})` : null;
+      return `<li class="item" style="display:block"><label style="display:flex;gap:10px;align-items:flex-start">
+        <input type="checkbox" data-i="${i}" ${done.has(f.id) ? '' : 'checked'} style="margin-top:5px">
+        <span><b>${esc(k ? deName(k) : f._frei || 'Unbestimmt')}</b>${done.has(f.id) ? ' <span class="badge">schon übernommen</span>' : ''}
+        <div class="tiny">${fmtDate(f.datum)}${f.ort ? ' · ' + esc(f.ort) : ''}${f.lat != null ? ' · 📍' : ''}${f._foto ? ' · 📷 Foto' : ''}</div>
+        ${p && !k ? '<div class="tiny">Diese Art steht nicht im Kosmos-Handbuch, der Name aus dem Parey wird übernommen.</div>' : ''}
+        ${p && k && norm(k.lat) !== norm(p.lat) ? `<div class="tiny">Im Parey: ${esc(p.de.split(',')[0])} (${esc(p.lat)})</div>` : ''}</span></label></li>`;
+    }).join('');
+    setView('Funde übernehmen', `
+      ${funde?.length ? `<div class="note">${quelle === 'app' ? `In der Parey-App auf diesem Gerät gibt es ${funde.length} Fund(e).` : `Die Sicherungsdatei enthält ${funde.length} Fund(e). Fotos sind in Sicherungsdateien nicht enthalten.`}</div>
+        <ul class="list">${rows}</ul>
+        <div class="sect">Wer soll die Funde sehen?</div>
+        <select class="inp" id="sicht">${myComms.map(c => `<option value="c${c.id}" ${activeComm()?.id === c.id ? 'selected' : ''}>👥 Community ${esc(c.name)}</option>`).join('')}
+          <option value="alle">🌍 Alle App-Nutzer*innen</option><option value="privat" ${myComms.length ? '' : 'selected'}>🔒 Nur ich</option></select>
+        <button class="btn primary" id="go">Ausgewählte Funde übernehmen</button>`
+      : `<div class="note">Auf diesem Gerät habe ich keine Funde aus der Parey-App gefunden. Die Übernahme klappt nur im selben Browser auf dem Handy, auf dem du die Funde angelegt hast.</div>`}
+      <div class="sect">Von einem anderen Gerät</div>
+      <p class="tiny">Exportiere in der Parey-App unter „Sicherung“ eine Datei und wähle sie hier aus. Fotos sind darin nicht enthalten, die kannst du danach beim Fund ergänzen.</p>
+      <label class="btn center">Sicherungsdatei wählen<input type="file" id="file" accept=".json,application/json,text/plain" hidden></label>
+      <div id="st" class="tiny"></div>`, 'funde');
+    document.getElementById('file').onchange = async e => {
+      const file = e.target.files[0]; if (!file) return;
+      try { const d = JSON.parse((await file.text()).replace(/^PILZBUCH-BILDER\s*/, '')); funde = (d.funde || []).filter(f => f && f.id && f.datum).map(f => ({...f, _foto: null})); quelle = 'datei'; draw(); }
+      catch { document.getElementById('st').textContent = 'Das ist keine Sicherungsdatei der Parey-App.'; }
+    };
+    const go = document.getElementById('go');
+    if (go) go.onclick = async () => {
+      const sv = document.getElementById('sicht').value;
+      const picked = [...$main.querySelectorAll('[data-i]:checked')].map(c => funde[+c.dataset.i]);
+      if (!picked.length) return;
+      go.disabled = true; go.textContent = 'Übernehme …';
+      for (const f of picked) {
+        const k = f._kid != null ? IDX.species[f._kid] : null;
+        const row = {art_id: k ? k.id : null, art_lat: k?.lat || null, art_de: k?.de || null, art_frei: k ? null : f._frei, unsicher: false,
+          datum: f.datum, lat: f.lat ?? null, lon: f.lon ?? null, genauigkeit: f.acc ?? null, ort: f.ort || null, notiz: f.notiz || null, fotos: [],
+          sichtbarkeit: sv.startsWith('c') ? 'community' : sv, community_id: sv.startsWith('c') ? sv.slice(1) : sv === 'alle' ? (activeComm()?.id || null) : null};
+        const nid = uuid();
+        await dbPut('outbox', nid, {op: 'upsert', id: nid, row, neu: f._foto ? [f._foto] : [], weg: [], t: Date.now()});
+        done.add(f.id);
+      }
+      store.set('importiert', [...done]);
+      await sync();
+      location.hash = '#/funde/meine/liste';
+    };
+  };
+  draw();
+}
+
 /* Communitys */
 async function viewCommunity(cid) {
   if (!sb || !session) return needLogin('Community');
@@ -1007,6 +1094,7 @@ async function route() {
     case 'konto': return viewKonto();
     case 'funde': return viewFunde(h[1], h[2] || 'liste');
     case 'community': return viewCommunity(h[1]);
+    case 'import': return viewImport();
     case 'beitreten': return viewBeitreten(h[1]);
     case 'fund':
       if (h[1] === 'neu') return viewFundEdit('neu', h[2] != null ? +h[2] : NaN);

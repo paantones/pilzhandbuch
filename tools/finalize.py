@@ -141,6 +141,8 @@ def group_of(sec):
     for g in GROUPS:
         if g.lower() in l: return g
     return sec.split('—')[0].strip().title()
+GLOSS_CAT_FIX = {"24": "Lamellenabstand", "25": "Lamellenabstand", "26": "Lamellenform", "27": "Lamellenform", "28": "Lamellenform", "29": "Lamellenform", "30": "Lamellenschneide", "31": "Lamellenschneide", "32": "Lamellenschneide", "33": "Lamellenhaltung", "34": "Lamellenhaltung", "35": "Lamellenhaltung", "36": "Lamellenhaltung", "37": "Lamellenhaltung", "56": "Knolle (Stielbasis)", "57": "Knolle (Stielbasis)", "58": "Knolle (Stielbasis)", "59": "Knolle (Stielbasis)"}
+for i, c in GLOSS_CAT_FIX.items(): gloss[int(i)]['cat'] = c
 out = dict(v=1, book='Das Kosmos Handbuch Pilze (Gminder/Karasch, 2023, eBook-PDF)', fp=fp,
     species=[dict(id=s['id'], p=s['p'], n=s['n'], de=s['de'], lat=s['lat'], syn=s['syn'], rl=s['rl'], prot=s['prot'], sec=group_of(s['sec']), sub=s['sec'].split('|')[-1].strip() if '|' in s['sec'] else '', hdr=s['hdr'], body=s['body'], plate=s['plate']) for s in S],
     keys=[dict(id=k['id'], title=k['title'], p=k['p'], steps={n: [dict(l=l['let'], p=l['p'], box=l['box'], go=l['go'], cnt=l['cnt'], ex=l['ex']) for l in ls] for n, ls in k['steps'].items()}) for k in K],
