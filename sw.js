@@ -1,4 +1,4 @@
-const V = 'pilzhandbuch-v2';
+const V = 'pilzhandbuch-v3';
 const SHELL = ['./', 'index.html', 'app.js', 'book.js', 'config.js', 'kosmos-index.json', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'vendor/pdf.min.mjs', 'vendor/pdf.worker.min.mjs', 'vendor/supabase.js', 'vendor/leaflet.js', 'vendor/leaflet.css',
   'vendor/images/marker-icon.png', 'vendor/images/marker-icon-2x.png', 'vendor/images/marker-shadow.png'];

@@ -201,8 +201,29 @@ let session = null, profile = null;
 async function initAuth() {
   if (!sb) return;
   const {data} = await sb.auth.getSession(); session = data.session;
-  sb.auth.onAuthStateChange((_e, s) => { session = s; if (s) { loadProfile(); sync(); } else profile = null; });
-  if (session) { loadProfile(); }
+  sb.auth.onAuthStateChange((_e, s) => {
+    session = s;
+    if (s) { loadProfile(); loadComms(); sync(); const j = store.get('joinCode', null); if (j) location.hash = '#/beitreten/' + j; }
+    else { profile = null; myComms = []; store.set('comms', []); }
+  });
+  if (session) { loadProfile(); loadComms(); }
+}
+let myComms = store.get('comms', []);
+async function loadComms() {
+  if (!sb || !session) return (myComms = []);
+  const {data, error} = await sb.from('mitglieder').select('rolle, communities(id, name)').eq('user_id', myId());
+  if (!error) {
+    myComms = (data || []).filter(x => x.communities).map(x => ({id: x.communities.id, name: x.communities.name, rolle: x.rolle})).sort((a, b) => a.name.localeCompare(b.name));
+    store.set('comms', myComms);
+  }
+  return myComms;
+}
+const activeComm = () => myComms.find(c => c.id === store.get('aktivComm', null)) || myComms[0] || null;
+const SICHT = {community: '👥', alle: '🌍', privat: '🔒'};
+function sichtText(f) {
+  if (f.sichtbarkeit === 'privat') return 'Nur für dich';
+  if (f.sichtbarkeit === 'alle') return 'Für alle App-Nutzer*innen' + (f.communities?.name ? ` (aus ${f.communities.name})` : '');
+  return 'Für die Community ' + (f.communities?.name || myComms.find(c => c.id === f.community_id)?.name || '');
 }
 async function loadProfile() {
   if (!sb || !session) return;
@@ -287,10 +308,10 @@ async function viewHome() {
     </div>
     <div class="sect">Schlüssel direkt</div>
     <div>${IDX.keys.filter(k => k.id > 0).map(k => `<a class="chip" href="#/k/${k.id}/1">${esc(k.title)}</a>`).join('')}</div>
-    <div class="sect">Funde der Community</div>
+    <div class="sect">Funde</div>
     <div class="row">
       <a class="btn" href="#/fund/neu"><b>＋ Neuer Fund</b><small>Mit Standort und Fotos</small></a>
-      <a class="btn" href="#/funde"><b>📍 Alle Funde</b><small>Liste und Karte</small></a>
+      <a class="btn" href="#/funde"><b>📍 Funde ansehen</b><small>Community, alle, eigene · Liste und Karte</small></a>
     </div>
     ${pend ? `<div class="sync">${pend} Änderung(en) warten auf Netz und werden automatisch hochgeladen.</div>` : ''}
     ${!sb ? '<div class="note">Die Fund-Datenbank ist noch nicht eingerichtet.</div>' : !session ? '<div class="note">Für Funde brauchst du ein Konto: <a href="#/konto">Anmelden oder registrieren</a></div>' : ''}
@@ -543,11 +564,11 @@ async function viewKonto() {
         const {data, error} = await sb.auth.signUp({email, password, options: {data: {name}, emailRedirectTo: location.origin + location.pathname}});
         if (error) return msg.textContent = 'Fehler: ' + error.message;
         if (!data.session) msg.textContent = 'Fast geschafft: Bitte bestätige deine E-Mail-Adresse über den Link, den du gleich bekommst. Danach kannst du dich hier anmelden.';
-        else location.hash = '#/funde';
+        else location.hash = store.get('joinCode', null) ? '#/beitreten/' + store.get('joinCode', null) : '#/funde';
       } else {
         const {error} = await sb.auth.signInWithPassword({email, password});
         if (error) return msg.textContent = error.message.includes('Invalid') ? 'E-Mail oder Passwort stimmt nicht.' : 'Fehler: ' + error.message;
-        location.hash = '#/funde';
+        location.hash = store.get('joinCode', null) ? '#/beitreten/' + store.get('joinCode', null) : '#/funde';
       }
     };
     const r = document.getElementById('reset');
@@ -569,6 +590,10 @@ async function viewKonto() {
       <button class="btn center" id="pwsave">Passwort ändern</button>
       <div id="msg" class="tiny"></div></div>
     ${pend ? `<div class="sync">${pend} Änderung(en) noch nicht hochgeladen. <button class="chip" id="syncnow">Jetzt hochladen</button></div>` : ''}
+    <div class="sect">Communitys</div>
+    <div id="comms">${spinner}</div>
+    <button class="btn center" id="newcomm">＋ Neue Community gründen</button>
+    <div class="row" style="align-items:center"><input class="inp" id="joincode" placeholder="Einladungslink oder Code" style="flex:2;min-width:160px"><button class="btn center" id="join" style="flex:1">Beitreten</button></div>
     <button class="btn center" id="out">Abmelden</button>
     <div class="sect">Buch auf diesem Gerät</div>
     <button class="btn center danger" id="rmpdf"><small>PDF von diesem Gerät entfernen</small></button>`, 'konto');
@@ -583,6 +608,22 @@ async function viewKonto() {
     const {error} = await sb.auth.updateUser({password: pw}); msg.textContent = error ? 'Fehler: ' + error.message : 'Passwort geändert.';
   };
   const sn = document.getElementById('syncnow'); if (sn) sn.onclick = async () => { await sync(); viewKonto(); };
+  loadComms().then(cs => {
+    const el = document.getElementById('comms'); if (!el) return;
+    el.innerHTML = cs.length ? `<ul class="list">${cs.map(c => `<li><a class="item" href="#/community/${c.id}"><span class="th" style="display:flex;align-items:center;justify-content:center;font-size:26px">👥</span><span class="txt"><div class="de">${esc(c.name)}</div><div class="tiny">${c.rolle === 'admin' ? 'Admin' : 'Mitglied'}${activeComm()?.id === c.id ? ' · Standard für neue Funde' : ''}</div></span></a></li>`).join('')}</ul>`
+      : '<div class="note">Du bist noch in keiner Community. Gründe eine oder tritt über einen Einladungslink bei. Ohne Community kannst du Funde privat oder für alle speichern.</div>';
+  });
+  document.getElementById('newcomm').onclick = async () => {
+    const name = prompt('Name der Community, z. B. „Pilzfreund*innen Halle“'); if (!name || name.trim().length < 2) return;
+    const id = uuid();
+    const {error} = await sb.from('communities').insert({id, name: name.trim()});
+    if (error) return alert('Konnte nicht angelegt werden: ' + error.message);
+    store.set('aktivComm', id); await loadComms(); location.hash = '#/community/' + id;
+  };
+  document.getElementById('join').onclick = () => {
+    const v = document.getElementById('joincode').value.trim(); if (!v) return;
+    location.hash = '#/beitreten/' + (v.match(/beitreten\/([0-9a-f]+)/)?.[1] || v);
+  };
   document.getElementById('out').onclick = async () => { await sb.auth.signOut(); session = null; viewKonto(); };
   document.getElementById('rmpdf').onclick = async () => { if (!confirm('Das Buch-PDF und alle daraus gelesenen Texte von diesem Gerät löschen? Deine Funde bleiben erhalten.')) return; await removePdf(); location.hash = '#/'; location.reload(); };
 }
@@ -591,8 +632,10 @@ async function viewKonto() {
 const needLogin = title => setView(title, !sb ? '<div class="note">Die Fund-Datenbank ist noch nicht eingerichtet.</div>' : '<div class="note">Für Funde brauchst du ein Konto.</div><a class="btn primary" href="#/konto">Anmelden oder registrieren</a>', 'funde');
 function fundName(f) { return f.art_id != null && IDX.species[f.art_id] ? deName(IDX.species[f.art_id]) : (f.art_frei || 'Unbestimmt'); }
 async function fetchFunde(filter = {}) {
-  let q = sb.from('funde').select('*, profiles(name), kommentare(count)').order('datum', {ascending: false}).order('created_at', {ascending: false}).limit(500);
+  let q = sb.from('funde').select('*, profiles(name), communities(name), kommentare(count)').order('datum', {ascending: false}).order('created_at', {ascending: false}).limit(500);
   if (filter.user) q = q.eq('user_id', filter.user);
+  if (filter.comm) q = q.eq('community_id', filter.comm).in('sichtbarkeit', ['community', 'alle']);
+  if (filter.alle) q = q.eq('sichtbarkeit', 'alle');
   if (filter.art != null) q = q.eq('art_id', filter.art);
   const {data, error} = await q;
   if (error) throw error;
@@ -611,26 +654,32 @@ async function fundListHtml(fs) {
     const thumb = src ? `<img class="th cover" src="${esc(src)}" alt="">` : f.art_id != null && IDX.species[f.art_id]?.plate ? `<img class="th" data-th="${f.art_id}" alt="">` : '<span class="th" style="display:flex;align-items:center;justify-content:center;font-size:24px">📍</span>';
     const nk = f.kommentare?.[0]?.count || 0;
     return `<li><a class="item" href="#/fund/${f.id}">${thumb}<span class="txt"><div class="de">${esc(fundName(f))}${f.unsicher ? ' <span class="tiny">(unsicher)</span>' : ''}</div>
-      <div class="tiny">${fmtDate(f.datum)} · ${esc(f.profiles?.name || '')}${f.ort ? ' · ' + esc(f.ort) : ''}${nk ? ` · 💬 ${nk}` : ''}${f._pending ? ' · ⏳ noch nicht hochgeladen' : ''}</div></span></a></li>`;
+      <div class="tiny">${SICHT[f.sichtbarkeit] || ''} ${fmtDate(f.datum)} · ${esc(f.profiles?.name || '')}${f.ort ? ' · ' + esc(f.ort) : ''}${nk ? ` · 💬 ${nk}` : ''}${f._pending ? ' · ⏳ noch nicht hochgeladen' : ''}</div></span></a></li>`;
   }).join('')}</ul>`;
 }
-async function viewFunde(tab = 'alle') {
+async function viewFunde(filt, mode = 'liste') {
   if (!sb || !session) return needLogin('Funde');
   const tok = ++viewToken;
+  if (!filt) filt = activeComm() ? 'c' + activeComm().id : 'alle';
+  const chips = [...myComms.map(c => ['c' + c.id, '👥 ' + c.name]), ['alle', '🌍 Alle'], ['meine', '🔒 Meine']];
   setView('Funde', `<a class="btn primary" href="#/fund/neu">＋ Neuer Fund</a>
-    <div>${[['alle', 'Alle'], ['meine', 'Meine'], ['karte', 'Karte']].map(([k, l]) => `<a class="chip ${k === tab ? 'on' : ''}" href="#/funde/${k}">${l}</a>`).join('')}</div>
+    <div>${chips.map(([k, l]) => `<a class="chip ${k === filt ? 'on' : ''}" href="#/funde/${k}/${mode}">${esc(l)}</a>`).join('')}</div>
+    <div style="margin:4px 0"><a class="chip ${mode === 'liste' ? 'on' : ''}" href="#/funde/${filt}/liste">Liste</a><a class="chip ${mode === 'karte' ? 'on' : ''}" href="#/funde/${filt}/karte">Karte</a></div>
+    <div class="tiny">${filt === 'alle' ? 'Funde, die Leute aus allen Communitys für alle freigegeben haben.' : filt === 'meine' ? 'Alle deine eigenen Funde, auch private.' : 'Funde dieser Community.'}${!myComms.length ? ' <a href="#/konto">Community gründen oder beitreten</a>' : ''}</div>
     <div id="fl">${spinner}</div>`, 'funde');
   sync();
+  const filter = filt === 'meine' ? {user: myId()} : filt === 'alle' ? {alle: true} : {comm: filt.slice(1)};
+  if (filter.comm) store.set('aktivComm', filter.comm);
   let fs;
-  try { fs = await fetchFunde(tab === 'meine' ? {user: myId()} : {}); await dbPut('cache', 'funde-' + tab, fs); }
-  catch (e) { fs = await dbGet('cache', 'funde-' + tab) || []; if (tok === viewToken) document.getElementById('fl').insertAdjacentHTML('beforebegin', '<div class="note warn">Offline: Du siehst den zuletzt geladenen Stand.</div>'); }
-  const pend = await localPending();
+  try { fs = await fetchFunde(filter); await dbPut('cache', 'funde-' + filt, fs); }
+  catch (e) { fs = await dbGet('cache', 'funde-' + filt) || []; if (tok === viewToken) document.getElementById('fl').insertAdjacentHTML('beforebegin', '<div class="note warn">Offline: Du siehst den zuletzt geladenen Stand.</div>'); }
+  const pend = (await localPending()).filter(p => filt === 'meine' || (filt === 'alle' ? p.sichtbarkeit === 'alle' : p.community_id === filter.comm && p.sichtbarkeit !== 'privat'));
   const ids = new Set(pend.map(p => p.id));
   fs = [...pend, ...fs.filter(f => !ids.has(f.id))];
   if (tok !== viewToken) return;
   const el = document.getElementById('fl');
-  if (tab === 'karte') return drawMap(el, fs);
-  el.innerHTML = fs.length ? await fundListHtml(fs) : '<div class="note">Noch keine Funde. Leg den ersten an!</div>';
+  if (mode === 'karte') return drawMap(el, fs);
+  el.innerHTML = fs.length ? await fundListHtml(fs) : '<div class="note">Hier gibt es noch keine Funde.</div>';
   lazyThumbs(el);
 }
 function drawMap(el, fs) {
@@ -648,7 +697,7 @@ async function artFunde(s, tok) {
     const fs = await fetchFunde({art: s.id});
     if (tok !== viewToken || !fs.length) return;
     const el = document.getElementById('artfunde');
-    el.innerHTML = `<div class="sect">Funde aus der Community (${fs.length})</div>` + await fundListHtml(fs.slice(0, 20));
+    el.innerHTML = `<div class="sect">Funde dieser Art (${fs.length})</div>` + await fundListHtml(fs.slice(0, 20));
   } catch {}
 }
 async function resizePhoto(file, max = 1600) {
@@ -662,7 +711,10 @@ async function viewFundEdit(fid, artId) {
   if (!sb || !session) return needLogin('Neuer Fund');
   const isNew = fid === 'neu';
   let f;
-  if (isNew) f = {id: uuid(), art_id: Number.isFinite(artId) ? artId : null, art_frei: '', unsicher: false, datum: new Date().toISOString().slice(0, 10), lat: null, lon: null, genauigkeit: null, ort: '', notiz: '', fotos: []};
+  await loadComms();
+  const ac = activeComm();
+  if (isNew) f = {id: uuid(), art_id: Number.isFinite(artId) ? artId : null, art_frei: '', unsicher: false, datum: new Date().toISOString().slice(0, 10), lat: null, lon: null, genauigkeit: null, ort: '', notiz: '', fotos: [],
+    sichtbarkeit: ac ? 'community' : 'privat', community_id: ac?.id || null};
   else {
     const job = await dbGet('outbox', fid);
     if (job && job.op !== 'delete') f = {...job.row, id: fid, _neu: job.neu || []};
@@ -687,9 +739,18 @@ async function viewFundEdit(fid, artId) {
     <div class="sect">Fotos</div>
     <div class="ph-edit" id="phs"></div>
     <label class="btn center">📷 Foto aufnehmen oder wählen<input type="file" id="foto" accept="image/*" multiple hidden></label>
+    <div class="sect">Wer sieht diesen Fund?</div>
+    <select class="inp" id="sicht">
+      ${myComms.map(c => `<option value="c${c.id}" ${f.sichtbarkeit === 'community' && f.community_id === c.id ? 'selected' : ''}>👥 Community ${esc(c.name)}</option>`).join('')}
+      <option value="alle" ${f.sichtbarkeit === 'alle' ? 'selected' : ''}>🌍 Alle App-Nutzer*innen (auch andere Communitys)</option>
+      <option value="privat" ${f.sichtbarkeit === 'privat' ? 'selected' : ''}>🔒 Nur ich</option>
+    </select>
+    <div class="tiny" id="sichthint"></div>
     <button class="btn primary" id="save">Speichern</button>
-    ${isNew ? '' : '<button class="btn center danger" id="del">Fund löschen</button>'}
-    <p class="tiny">Alle Mitglieder sehen diesen Fund mit genauem Standort, Fotos und deinem Namen.</p>`, 'funde');
+    ${isNew ? '' : '<button class="btn center danger" id="del">Fund löschen</button>'}`, 'funde');
+  const sel = document.getElementById('sicht'), hint = document.getElementById('sichthint');
+  const showHint = () => hint.textContent = sel.value === 'privat' ? 'Nur du siehst diesen Fund.' : sel.value === 'alle' ? 'Alle angemeldeten Nutzer*innen der App sehen den Fund mit genauem Standort, Fotos und deinem Namen.' : 'Alle Mitglieder dieser Community sehen den Fund mit genauem Standort, Fotos und deinem Namen.';
+  sel.onchange = showHint; showHint();
   const showArt = () => {
     const s = f.art_id != null ? IDX.species[f.art_id] : null;
     document.getElementById('artsel').innerHTML = s ? `<div class="de">${esc(s.de)}</div><div class="lat">${esc(s.lat)}</div><button class="chip" id="artclr">Entfernen</button>`
@@ -731,6 +792,10 @@ async function viewFundEdit(fid, artId) {
     const row = {art_id: f.art_id, art_lat: f.art_id != null ? IDX.species[f.art_id].lat : null, art_de: f.art_id != null ? IDX.species[f.art_id].de : null, art_frei: f.art_frei || null,
       unsicher: document.getElementById('uns').checked, datum: document.getElementById('datum').value || f.datum,
       lat: f.lat, lon: f.lon, genauigkeit: f.genauigkeit, ort: document.getElementById('ort').value.trim() || null, notiz: document.getElementById('notiz').value.trim() || null, fotos};
+    const sv = sel.value;
+    if (sv.startsWith('c')) { row.sichtbarkeit = 'community'; row.community_id = sv.slice(1); store.set('aktivComm', row.community_id); }
+    else if (sv === 'alle') { row.sichtbarkeit = 'alle'; row.community_id = (f.community_id && myComms.some(c => c.id === f.community_id)) ? f.community_id : (activeComm()?.id || null); }
+    else { row.sichtbarkeit = 'privat'; row.community_id = null; }
     const prev = await dbGet('outbox', f.id);
     await dbPut('outbox', f.id, {op: 'upsert', id: f.id, row, neu, weg: [...(prev?.weg || []), ...weg], t: Date.now()});
     await sync();
@@ -750,7 +815,7 @@ async function viewFund(fid) {
   let f = null, pend = false;
   const job = await dbGet('outbox', fid);
   if (job && job.op !== 'delete') { f = {...job.row, id: fid, user_id: myId(), profiles: {name: profile?.name || 'Ich'}}; pend = true; }
-  else { const {data} = await sb.from('funde').select('*, profiles(name)').eq('id', fid).maybeSingle().then(r => r, () => ({data: null})); f = data; }
+  else { const {data} = await sb.from('funde').select('*, profiles(name), communities(name)').eq('id', fid).maybeSingle().then(r => r, () => ({data: null})); f = data; }
   if (!f) return setView('Fund', '<div class="note">Diesen Fund gibt es nicht (mehr).</div>', 'funde');
   if (tok !== viewToken) return;
   const s = f.art_id != null ? IDX.species[f.art_id] : null;
@@ -761,6 +826,7 @@ async function viewFund(fid) {
       ${s ? `<a href="#/art/${s.id}" class="item" style="border:0;padding:0"><img class="th" data-th="${s.id}" alt=""><span class="txt"><div class="de">${esc(s.de)}</div><div class="lat">${esc(s.lat)}</div><div class="tiny">Im Buch öffnen ›</div></span></a>` : `<div class="de">${esc(fundName(f))}</div>`}
       ${f.unsicher ? '<div class="note warn">Bestimmung unsicher</div>' : ''}
       <div class="tiny" style="margin-top:8px">${fmtDate(f.datum)} · gefunden von ${esc(f.profiles?.name || '')}</div>
+      <div class="tiny">${SICHT[f.sichtbarkeit] || ''} ${esc(sichtText(f))}</div>
       ${pend ? `<div class="sync">⏳ Wird hochgeladen, sobald Netz da ist${job.neu?.length ? ` (${job.neu.length} Foto(s))` : ''}.</div>` : ''}
     </div>
     ${urls.length ? `<div class="photos">${urls.map(u => `<img src="${esc(u)}" alt="">`).join('')}</div>` : ''}
@@ -786,6 +852,112 @@ async function loadKommentare(fid, tok) {
     if (error) return alert('Kommentar konnte nicht gespeichert werden: ' + error.message);
     loadKommentare(fid, tok);
   };
+}
+
+/* Communitys */
+async function viewCommunity(cid) {
+  if (!sb || !session) return needLogin('Community');
+  const tok = ++viewToken;
+  setView('Community', spinner, 'konto');
+  const [{data: c}, {data: ms}] = await Promise.all([
+    sb.from('communities').select('*').eq('id', cid).maybeSingle(),
+    sb.from('mitglieder').select('user_id, rolle, created_at, profiles(name)').eq('community_id', cid).order('created_at')]);
+  if (tok !== viewToken) return;
+  if (!c) return setView('Community', '<div class="note">Diese Community gibt es nicht oder du bist kein Mitglied (mehr).</div>', 'konto');
+  const me = (ms || []).find(m => m.user_id === myId());
+  const admin = me?.rolle === 'admin';
+  const admins = (ms || []).filter(m => m.rolle === 'admin').length;
+  let inv = [];
+  if (admin) inv = (await sb.from('einladungen').select('*').eq('community_id', cid).order('created_at', {ascending: false})).data || [];
+  const link = code => location.origin + location.pathname + '#/beitreten/' + code;
+  setView(c.name, `
+    <div class="card">
+      <h2 style="margin:0">${esc(c.name)}</h2>
+      ${c.beschreibung ? `<p>${esc(c.beschreibung)}</p>` : ''}
+      <div class="tiny">${ms.length} Mitglied${ms.length === 1 ? '' : 'er'} · du bist ${admin ? 'Admin' : 'Mitglied'}</div>
+      <a class="btn center" href="#/funde/c${c.id}/liste">Funde dieser Community</a>
+      ${activeComm()?.id !== c.id ? '<button class="btn center" id="aktiv">Als Standard für neue Funde wählen</button>' : '<div class="tiny">Standard für neue Funde</div>'}
+    </div>
+    ${admin ? `<div class="sect">Leute einladen</div>
+      <div class="tiny">Ein Einladungslink gilt 30 Tage. Wer ihn öffnet und angemeldet ist, wird Mitglied.</div>
+      <button class="btn primary" id="newinv">Einladungslink erstellen</button>
+      <ul class="list">${inv.map(i => {
+        const abgelaufen = new Date(i.gueltig_bis) < new Date();
+        return `<li class="item" style="display:block"><div class="tiny">${abgelaufen ? 'abgelaufen' : 'gültig bis ' + new Date(i.gueltig_bis).toLocaleDateString('de-DE')} · ${i.nutzungen}× genutzt</div>
+          <div style="word-break:break-all;font-size:13px">${esc(link(i.code))}</div>
+          <button class="chip" data-share="${esc(i.code)}">Teilen / kopieren</button><button class="chip" data-revoke="${esc(i.code)}">Widerrufen</button></li>`;
+      }).join('')}</ul>` : ''}
+    <div class="sect">Mitglieder</div>
+    <ul class="list">${ms.map(m => `<li class="item" style="display:flex;justify-content:space-between;flex-wrap:wrap">
+      <span><b>${esc(m.profiles?.name || '?')}</b>${m.user_id === myId() ? ' (du)' : ''} <span class="tiny">${m.rolle === 'admin' ? 'Admin' : 'Mitglied'}</span></span>
+      ${admin && m.user_id !== myId() ? `<span>${m.rolle === 'admin' ? `<button class="chip" data-rolle="mitglied" data-u="${m.user_id}">Admin-Rechte entziehen</button>` : `<button class="chip" data-rolle="admin" data-u="${m.user_id}">Zum Admin machen</button>`}<button class="chip" data-kick="${m.user_id}">Entfernen</button></span>` : ''}
+    </li>`).join('')}</ul>
+    ${admin ? `<div class="sect">Verwaltung</div>
+      <button class="btn center" id="rename">Name und Beschreibung ändern</button>` : ''}
+    <button class="btn center danger" id="leave">Community verlassen</button>
+    ${admin ? '<button class="btn center danger" id="delc"><small>Community auflösen</small></button>' : ''}
+    <p class="tiny">Funde, die du für diese Community gespeichert hast, bleiben erhalten. Wenn du austrittst, sehen die anderen sie nicht mehr, außer du hast sie für alle freigegeben.</p>`, 'konto');
+  const reload = () => viewCommunity(cid);
+  const a = document.getElementById('aktiv'); if (a) a.onclick = () => { store.set('aktivComm', c.id); reload(); };
+  const share = async code => {
+    const url = link(code), text = `Komm in unsere Pilz-Community „${c.name}“ in der Pilzhandbuch-App: ${url}`;
+    try { if (navigator.share) { await navigator.share({title: c.name, text, url}); return; } } catch (e) { if (e.name === 'AbortError') return; }
+    try { await navigator.clipboard.writeText(url); alert('Link kopiert.'); } catch { prompt('Link kopieren:', url); }
+  };
+  const ni = document.getElementById('newinv');
+  if (ni) ni.onclick = async () => {
+    const {data, error} = await sb.from('einladungen').insert({community_id: cid}).select().single();
+    if (error) return alert('Fehler: ' + error.message);
+    await share(data.code); reload();
+  };
+  $main.querySelectorAll('[data-share]').forEach(b => b.onclick = () => share(b.dataset.share));
+  $main.querySelectorAll('[data-revoke]').forEach(b => b.onclick = async () => { await sb.from('einladungen').delete().eq('code', b.dataset.revoke); reload(); });
+  $main.querySelectorAll('[data-rolle]').forEach(b => b.onclick = async () => {
+    const {error} = await sb.from('mitglieder').update({rolle: b.dataset.rolle}).eq('community_id', cid).eq('user_id', b.dataset.u);
+    if (error) alert('Fehler: ' + error.message); reload();
+  });
+  $main.querySelectorAll('[data-kick]').forEach(b => b.onclick = async () => {
+    if (!confirm('Diese Person aus der Community entfernen?')) return;
+    const {error} = await sb.from('mitglieder').delete().eq('community_id', cid).eq('user_id', b.dataset.kick);
+    if (error) alert('Fehler: ' + error.message); reload();
+  });
+  const rn = document.getElementById('rename');
+  if (rn) rn.onclick = async () => {
+    const name = prompt('Name der Community', c.name); if (name == null) return;
+    const beschreibung = prompt('Kurze Beschreibung (optional)', c.beschreibung || ''); if (beschreibung == null) return;
+    const {error} = await sb.from('communities').update({name: name.trim(), beschreibung: beschreibung.trim() || null}).eq('id', cid);
+    if (error) alert('Fehler: ' + error.message); await loadComms(); reload();
+  };
+  document.getElementById('leave').onclick = async () => {
+    if (admin && admins === 1 && ms.length > 1) return alert('Du bist die einzige Admin-Person. Mach vorher jemand anderen zum Admin.');
+    if (!confirm(`„${c.name}“ wirklich verlassen?`)) return;
+    const {error} = await sb.from('mitglieder').delete().eq('community_id', cid).eq('user_id', myId());
+    if (error) return alert('Fehler: ' + error.message);
+    if (store.get('aktivComm', null) === cid) store.set('aktivComm', null);
+    await loadComms(); location.hash = '#/konto';
+  };
+  const dc = document.getElementById('delc');
+  if (dc) dc.onclick = async () => {
+    if (prompt(`Zum Auflösen bitte den Namen „${c.name}“ eintippen. Funde bleiben bei ihren Finder*innen, sind dann aber nur noch für sie sichtbar (außer „für alle“).`) !== c.name) return;
+    const {error} = await sb.from('communities').delete().eq('id', cid);
+    if (error) return alert('Fehler: ' + error.message);
+    await loadComms(); location.hash = '#/konto';
+  };
+}
+async function viewBeitreten(code) {
+  if (!sb) return needLogin('Einladung');
+  if (!session) {
+    store.set('joinCode', code);
+    return setView('Einladung', '<div class="note">Du wurdest in eine Pilz-Community eingeladen. Melde dich an oder registriere dich, danach geht es automatisch weiter.</div><a class="btn primary" href="#/konto">Anmelden oder registrieren</a>', 'konto');
+  }
+  setView('Einladung', spinner, 'konto');
+  store.set('joinCode', null);
+  const {data, error} = await sb.rpc('community_beitreten', {p_code: code});
+  if (error || !data?.length) return setView('Einladung', `<div class="note warn">${esc(error?.message?.includes('ungültig') ? 'Diese Einladung ist ungültig oder abgelaufen. Bitte frag nach einem neuen Link.' : 'Beitritt hat nicht geklappt: ' + (error?.message || ''))}</div><a class="btn center" href="#/konto">Zum Konto</a>`, 'konto');
+  store.set('aktivComm', data[0].community_id);
+  await loadComms();
+  setView('Willkommen', `<div class="card"><h2 style="margin-top:0">Willkommen in „${esc(data[0].name)}“ 🍄</h2><p>Neue Funde werden ab jetzt standardmäßig mit dieser Community geteilt. Das kannst du bei jedem Fund ändern.</p>
+    <a class="btn primary" href="#/funde/c${data[0].community_id}/liste">Funde der Community ansehen</a></div>`, 'funde');
 }
 
 /* Einrichtung: eigenes PDF laden */
@@ -833,7 +1005,9 @@ async function route() {
     case 'merkmale': return viewMerkmale();
     case 'seite': return viewSeite(+h[1] || 0);
     case 'konto': return viewKonto();
-    case 'funde': return viewFunde(h[1] || 'alle');
+    case 'funde': return viewFunde(h[1], h[2] || 'liste');
+    case 'community': return viewCommunity(h[1]);
+    case 'beitreten': return viewBeitreten(h[1]);
     case 'fund':
       if (h[1] === 'neu') return viewFundEdit('neu', h[2] != null ? +h[2] : NaN);
       if (h[2] === 'bearbeiten') return viewFundEdit(h[1]);
@@ -844,6 +1018,7 @@ async function route() {
 window.addEventListener('hashchange', () => { if ($zoom.classList.contains('on')) { $zoom.classList.remove('on'); $zin.innerHTML = ''; } route(); });
 
 async function start() {
+  const jm = location.hash.match(/^#\/beitreten\/([0-9a-zA-Z]+)/); if (jm && !session) store.set('joinCode', jm[1]);
   const blob = await loadPdfBlob();
   if (!blob) return viewSetup();
   try { doc = await openPdf(blob); }
