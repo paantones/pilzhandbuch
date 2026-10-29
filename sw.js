@@ -1,4 +1,4 @@
-const V = 'pilzhandbuch-v6';
+const V = 'pilzhandbuch-v7';
 const SHELL = ['./', 'index.html', 'app.js', 'book.js', 'glossar.js', 'config.js', 'parey-map.json', 'kosmos-index.json', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'vendor/pdf.min.mjs', 'vendor/pdf.worker.min.mjs', 'vendor/supabase.js', 'vendor/leaflet.js', 'vendor/leaflet.css',
   'vendor/images/marker-icon.png', 'vendor/images/marker-icon-2x.png', 'vendor/images/marker-shadow.png'];
@@ -8,6 +8,6 @@ self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (e.request.method !== 'GET' || u.origin !== location.origin) return;
   // App-Dateien: zuerst Netz (damit Updates ankommen), sonst Cache
-  e.respondWith(fetch(e.request).then(r => { if (r.ok) { const c = r.clone(); caches.open(V).then(x => x.put(e.request, c)); } return r; })
+  e.respondWith(fetch(e.request, {cache: 'no-cache'}).then(r => { if (r.ok) { const c = r.clone(); caches.open(V).then(x => x.put(e.request, c)); } return r; })
     .catch(() => caches.match(e.request, {ignoreSearch: true}).then(r => r || caches.match('index.html'))));
 });

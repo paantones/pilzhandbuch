@@ -110,7 +110,7 @@ ul.list{list-style:none;margin:0;padding:0}
 </head>
 <body>
 <header class="top"><button id="back" aria-label="Zurück">‹</button><h1 id="title">Pilzhandbuch</h1><button id="fsz" aria-label="Schriftgröße">Aa</button></header>
-<main id="main"><div class="spinner"></div></main>
+<main id="main"><div class="spinner" id="boot"></div></main>
 <nav class="tabs" id="tabs" hidden>
   <a href="#/" data-t="home"><span>🍄</span>Start</a>
   <a href="#/k/0/1" data-t="k"><span>🔑</span>Bestimmen</a>
@@ -126,8 +126,8 @@ addEventListener('error', e => __errs.push((e.message || 'Fehler') + (e.filename
 addEventListener('unhandledrejection', e => __errs.push('Promise: ' + (e.reason && (e.reason.message || e.reason))));
 window.__fail = e => { __errs.push(String(e && (e.message || e))); __show(); };
 function __show() {
-  if (window.__started && !__errs.length) return;
-  var t = document.getElementById('tabs'); if (t && !t.hidden && !__errs.length) return;
+  // nur anzeigen, wenn die App noch gar nichts dargestellt hat
+  if (!document.getElementById('boot')) return;
   var m = document.getElementById('main'); if (!m) return;
   m.innerHTML = '<div class="card"><b>Der Start hängt.</b><p class="tiny">Schritt: ' + __step + '</p>' +
     (__errs.length ? '<pre style="white-space:pre-wrap;font-size:12px">' + __errs.map(function (x) { return String(x).replace(/</g, '&lt;'); }).join('\n') + '</pre>' : '<p class="tiny">Keine Fehlermeldung.</p>') +
@@ -140,7 +140,7 @@ function __reset() {
   if (window.caches) p.push(caches.keys().then(function (ks) { return Promise.all(ks.map(function (k) { return caches.delete(k); })); }));
   Promise.all(p).then(function () { location.reload(); });
 }
-setTimeout(function () { var t = document.getElementById('tabs'); if (!window.__started && t && t.hidden) __show(); }, 15000);
+setTimeout(__show, 15000);
 </script>
 <script src="vendor/supabase.js"></script>
 <script src="vendor/leaflet.js"></script>
