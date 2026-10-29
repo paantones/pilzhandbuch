@@ -197,7 +197,9 @@ const deName = s => s.de.split(',')[0];
 const RL = {'0': 'ausgestorben oder verschollen', '1': 'vom Aussterben bedroht', '2': 'stark gefährdet', '3': 'gefährdet', 'G': 'Gefährdung unbekannten Ausmaßes', 'R': 'extrem selten', 'V': 'Vorwarnliste', 'D': 'Daten unzureichend'};
 
 /* ---------- Supabase ---------- */
-const sb = SUPABASE_URL && window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {auth: {persistSession: true, autoRefreshToken: true}}) : null;
+const sb = SUPABASE_URL && window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {auth: {persistSession: true, autoRefreshToken: true,
+  // keine geräteweite Sperre: verhindert, dass Abfragen nach einem Anmelde-Ereignis endlos warten
+  lock: async (_name, _timeout, fn) => fn()}}) : null;
 let session = null, profile = null;
 async function initAuth() {
   if (!sb) return;
